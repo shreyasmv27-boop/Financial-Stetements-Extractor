@@ -50,6 +50,7 @@ UNIT_FACTORS = {"rupees": 1, "thousand": 1e3, "lakh": 1e5, "million": 1e6, "cror
 UNIT_LABEL = {"rupees": "₹", "thousand": "₹ thousand", "lakh": "₹ lakh", "million": "₹ million", "crore": "₹ crore", "billion": "₹ billion"}
 PAT_RE = re.compile(r"^(net )?(profit|loss)( loss)?( for the (year|period)| after tax(es|ation)?)( from continuing operations)?$|^profit after tax")
 AFTER_PAT = re.compile(r"other comprehensive|total comprehensive|earnings? per|attributable to|^owners|non controlling|appropriation")
+NET_CHANGE_RE = re.compile(r"^net (increase|decrease|change|movement|inflow|outflow).*\bcash\b")
 
 
 def is_num(s: str) -> bool:
@@ -607,7 +608,7 @@ def find_row(st, rx):
 
 def run_checks(st, typ):
     res = []
-    tol = 0.06 if st["decimals"] else 1.5
+    tol = (0.06 if st["decimals"] else 1.5) * st.get("tol_scale", 1)
 
     def v(r, i):
         return r["vals"][i]["v"] if r and r["vals"][i] else None
@@ -667,7 +668,8 @@ FOREIGN = {
 MUST = {
     "BS": [(r"^total assets$|^total$|^total equity and liabilities$|^total capital and liabilities$", "a total assets line")],
     "PL": [(r"revenue|income|interest earned", "a revenue or income line"), (PAT_RE.pattern, "a profit after tax line")],
-    "CF": [(r"operating activities", "operating activities"), (r"investing activities|financing activities", "investing or financing activities")],
+    "CF": [(r"operating activities", "operating activities"), (r"investing activities|financing activities", "investing or financing activities"),
+           (NET_CHANGE_RE.pattern, "a net change in cash line")],
 }
 
 
@@ -752,11 +754,13 @@ def build_statement(pages, typ, basis, page_nums, fy_hint):
             use.append(nx)
         if len(use) > 1:
             st = parse_statement(use, typ, fy_hint)
-    if typ == "PL":
-        trim_after_profit(st)
     st.update(type=typ, basis=basis, name=TYPES[typ]["name"], pages=[p["n"] for p in use],
               pdfPages=list(dict.fromkeys(p["pdfPage"] for p in use)), where=", ".join(page_name(p) for p in use))
-    st["checks"] = run_checks(st, typ)
+    st["checks"] = run_checks(st, typ)  # ties are checked on the full statement as printed
+    if typ == "PL":
+        trim_after_profit(st)
+    if typ == "CF":
+        trim_after_cash_change(st)
     return st
 
 
@@ -771,6 +775,17 @@ def trim_after_profit(st):
         st["rows"] = st["rows"][:pats[-1] + 1]
         st["rows"][-1]["kind"] = "total"
         st["endsAtProfit"] = True
+    return st
+
+
+def trim_after_cash_change(st):
+    """A cash flow statement ends at the net change in cash: opening and closing balances and anything after are dropped."""
+    for i, r in enumerate(st["rows"]):
+        if r["hasVals"] and NET_CHANGE_RE.search(norm_label(r["label"])):
+            st["rows"] = st["rows"][:i + 1]
+            st["rows"][-1]["kind"] = "total"
+            st["endsAtNetChange"] = True
+            break
     return st
 
 
@@ -917,8 +932,14 @@ def merge_years(items, out_unit):
             for c, k in zip(r["vals"], x["keys"]):
                 if c:
                     src.setdefault((norm_label(r["label"]), k), []).append(c["v"])
+    # printed reports round each line; the allowed rounding gap grows when figures are converted to a larger number
+    scale = 1.0
+    for f, st in items:
+        src = unit_of(st)
+        factor = UNIT_FACTORS[src] / UNIT_FACTORS[out_unit] if (out_unit != "reported" and src) else 1.0
+        scale = max(scale, factor * 10 ** (2 - st["decimals"]))
     m = {"periods": periods, "rows": rows, "units": units, "files": [x["file"] for x in views],
-         "decimals": max(x["v"]["decimals"] for x in views), "sources": sources}
+         "decimals": max(x["v"]["decimals"] for x in views), "sources": sources, "tol_scale": scale}
     return m
 
 
@@ -974,7 +995,7 @@ def integrity(m, typ):
         prev_total = t
         if len(block) < 2 or not norm_label(r["label"]).startswith("total"):
             continue
-        tol = 0.011 * len(block) + 0.02 if m["decimals"] else 1.5
+        tol = (0.011 * len(block) + 0.02) * m.get("tol_scale", 1)
         held, broke = [], []
         for i, p in enumerate(m["periods"]):
             if p["key"] not in r["vals"]:
@@ -985,7 +1006,7 @@ def integrity(m, typ):
             issues.append(f"\"{r['label']}\" no longer equals the lines above it for {', '.join(b[0] for b in broke)}, so a value may be in the wrong year or line")
     pseudo = {"rows": [{"label": r["label"], "hasVals": r["kind"] != "heading",
                         "vals": [r["vals"].get(p["key"]) for p in m["periods"]]} for r in m["rows"]],
-              "periods": m["periods"], "decimals": m["decimals"]}
+              "periods": m["periods"], "decimals": m["decimals"], "tol_scale": m.get("tol_scale", 1)}
     for c in run_checks(pseudo, typ):
         if c["hard"] and not c["ok"]:
             issues.append(f"after combining the reports, {c['name']} is off by {abs(c['diff']):g} for {c['period']}")
@@ -998,38 +1019,51 @@ def combine(items, out_unit, typ):
     return integrity(merge_years(items, out_unit), typ)
 
 
+SHEET_NAMES = {"BS": "Balance Sheet", "PL": "Income Statement", "CF": "Cash Flow Statement"}
+
+
 def build_workbook(reports, out_unit, basis) -> bytes:
-    """reports: [(report_name, report)]. Only statements that passed verification and the final integrity check are written."""
+    """Four tabs: Balance Sheet, Income Statement, Cash Flow Statement, Checks.
+    Each statement tab holds every year from every report, oldest to latest. A statement is written only if it
+    passed verification and the final check; the workbook is then read back and compared figure by figure."""
     from openpyxl import Workbook
     from openpyxl.comments import Comment
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
     wb = Workbook()
-    summ = wb.active
-    summ.title = "Summary"
+    wb.remove(wb.active)
     bold = Font(bold=True)
+    red, green = Font(bold=True, color="FFD70015"), Font(bold=True, color="FF1A7F37")
     top_line = Border(top=Side(style="thin", color="FF1D1D1F"))
     head_fill = PatternFill("solid", fgColor="FFF5F5F7")
-    SHORT = {"BS": "BS", "PL": "P&L", "CF": "CF"}
-    out_label = "As reported" if out_unit == "reported" else UNIT_LABEL[out_unit]
+    out_label = "as reported" if out_unit == "reported" else UNIT_LABEL[out_unit]
 
     def fmt(d):
         z = "0." + "0" * d if d > 0 else "0"
         return f"#,##{z};(#,##{z});{z}"
 
-    def safe_name(base):
-        n = re.sub(r"[\\/*?:\[\]]", "", base)[:31]
-        i = 2
-        while n in wb.sheetnames:
-            n = base[:28] + f" {i}"
-            i += 1
-        return n
-
-    def write_table(ws, title, subtitle, m, has_note):
-        ws["A1"] = title
+    final, written = {}, {}
+    for typ in ("BS", "PL", "CF"):
+        ws = wb.create_sheet(SHEET_NAMES[typ])
+        items = [(f, s) for f, rep in reports for s in rep["statements"] if s["basis"] == basis and s["type"] == typ and s["verified"]]
+        ws["A1"] = f"{basis} {SHEET_NAMES[typ]}"
         ws["A1"].font = Font(bold=True, size=13)
-        ws["A2"] = subtitle
+        ws.column_dimensions["A"].width = 64
+        if not items:
+            ws["A2"] = f"Not included: no {basis.lower()} {SHEET_NAMES[typ].lower()} passed verification. See the Checks tab."
+            ws["A2"].font = red
+            final[typ] = None
+            continue
+        m = combine(items, out_unit, typ)
+        final[typ] = m
+        if not m["ok"]:
+            ws["A2"] = "Not included: the final check failed. See the Checks tab."
+            ws["A2"].font = red
+            continue
+        has_note = len(items) == 1
+        unit = (UNIT_LABEL[m["units"][0]] if m["units"][0] else "as reported in each report") if len(m["units"]) == 1 else "mixed, choose ₹ crore or ₹ million to align them"
+        ws["A2"] = f"Units: {unit} · from {', '.join(m['files'])} · 0 means the report shows no figure for that year"
         ws["A2"].font = Font(italic=True, color="FF6E6E73")
         first = 2 + (1 if has_note else 0)
         hdr = ["Particulars"] + (["Note"] if has_note else []) + [p["label"] for p in m["periods"]]
@@ -1037,19 +1071,14 @@ def build_workbook(reports, out_unit, basis) -> bytes:
             c = ws.cell(row=4, column=j, value=h)
             c.font, c.fill = bold, head_fill
             c.alignment = Alignment(horizontal="left" if j == 1 else "right")
-        for i, p in enumerate(m["periods"]):
-            c = ws.cell(row=5, column=first + i, value=p.get("header") or "")
-            c.font = Font(size=8, color="FF8E8E93")
-            c.alignment = Alignment(horizontal="right", wrap_text=True)
-        r = 6
+        r = 5
         for row in m["rows"]:
             ws.cell(row=r, column=1, value=row["label"])
             if has_note and row.get("note"):
                 ws.cell(row=r, column=2, value=row["note"]).alignment = Alignment(horizontal="center")
             is_bold = row["kind"] != "item"
-            if is_bold:
-                ws.cell(row=r, column=1).font = bold
-            else:
+            ws.cell(row=r, column=1).font = bold if is_bold else Font()
+            if not is_bold:
                 ws.cell(row=r, column=1).alignment = Alignment(indent=1)
             if row["kind"] != "heading":
                 d = 2 if row["noConvert"] else m["decimals"]
@@ -1064,81 +1093,106 @@ def build_workbook(reports, out_unit, basis) -> bytes:
                     if rs:
                         c.comment = Comment(f"Shown as {rs['v']} in {rs['file']}. The newer report's figure is used here.", "Extractor")
             r += 1
-        ws.column_dimensions["A"].width = 62
         if has_note:
             ws.column_dimensions["B"].width = 8
         for j in range(first, len(hdr) + 1):
             ws.column_dimensions[get_column_letter(j)].width = 14
-        ws.freeze_panes = ws.cell(row=6, column=first)
+        ws.freeze_panes = ws.cell(row=5, column=first)
+        written[typ] = (ws, m, first)
 
-    def summary_row(values, bad=False):
-        nonlocal sr
-        for j, val in enumerate(values, start=1):
-            summ.cell(row=sr, column=j, value=val)
-        if bad:
-            summ.cell(row=sr, column=7).font = Font(bold=True, color="FFD70015")
-        sr += 1
-
-    summ["A1"] = "Financial Statements Extractor"
-    summ["A1"].font = Font(bold=True, size=14)
-    summ["A2"] = (f"{basis} statements · output units: {out_label} · years run oldest to latest · 0 means the report shows no figure · "
-                  f"generated {datetime.now():%d %b %Y %H:%M}")
-    for j, h in enumerate(["Report", "Statement", "Sheet", "Taken from", "Unit in report", "Years", "Published", "Notes"], start=1):
-        c = summ.cell(row=4, column=j, value=h)
-        c.font, c.fill = bold, head_fill
-    for j, w in enumerate([22, 16, 24, 40, 16, 30, 10, 90], start=1):
-        summ.column_dimensions[get_column_letter(j)].width = w
-    sr = 5
-
-    if len(reports) > 1:
-        for typ in ("BS", "PL", "CF"):
-            items = [(f, s) for f, rep in reports for s in rep["statements"] if s["basis"] == basis and s["type"] == typ and s["verified"]]
-            if len(items) < 2:
+    # ---- read the sheets back: every line, in order, with every figure in its year ----
+    readback = {}
+    for typ, (ws, m, first) in written.items():
+        problems, figures = [], 0
+        hdr = [ws.cell(row=4, column=first + i).value for i in range(len(m["periods"]))]
+        if hdr != [p["label"] for p in m["periods"]]:
+            problems.append("year columns are not in the expected order")
+        labels = []
+        for k, row in enumerate(m["rows"]):
+            rr = 5 + k
+            if ws.cell(row=rr, column=1).value != row["label"]:
+                problems.append(f"row {rr} should be \"{row['label']}\"")
                 continue
-            m = combine(items, out_unit, typ)
-            if not m["ok"]:
-                summary_row(["All reports", items[0][1]["name"] + " (all years)", "Not included", "", "", "", "No", "Failed final check: " + "; ".join(m["issues"])], True)
+            labels.append(row["label"])
+            if row["kind"] == "heading":
                 continue
-            ws = wb.create_sheet(safe_name(f"All years {SHORT[typ]}"))
-            ut = (UNIT_LABEL[m["units"][0]] if m["units"][0] else "as reported") if len(m["units"]) == 1 else "mixed, choose ₹ crore or ₹ million to align them"
-            write_table(ws, f"{basis} {items[0][1]['name']}, all years",
-                        f"Units: {ut} · from {', '.join(m['files'])} · where years overlap the newer report is used (older figure in a cell comment)", m, False)
-            summary_row(["All reports", items[0][1]["name"] + " (all years)", ws.title, "", "", ", ".join(p["label"] for p in m["periods"]), "Yes",
-                         "Checked: no repeated lines, every year complete, totals tie for every year"])
+            for i in range(len(m["periods"])):
+                got, want = ws.cell(row=rr, column=first + i).value, cell(m, row, i)
+                figures += 1
+                if got is None or abs(got - want) > 1e-9:
+                    problems.append(f"{row['label']} {m['periods'][i]['label']}: sheet has {got}, expected {want}")
+        if ws.cell(row=5 + len(m["rows"]), column=1).value is not None:
+            problems.append("extra rows found below the statement")
+        readback[typ] = (figures, problems)
 
-    checks_rows = []
+    # ---- Checks tab ----
+    ck = wb.create_sheet("Checks")
+    ck["A1"] = "Checks"
+    ck["A1"].font = Font(bold=True, size=13)
+    ck["A2"] = f"{basis} statements · output units: {out_label} · per-share figures are never converted · generated {datetime.now():%d %b %Y %H:%M}"
+    ck["A2"].font = Font(italic=True, color="FF6E6E73")
+    rr = 4
+
+    def heading(text, cols):
+        nonlocal rr
+        rr += 1
+        ck.cell(row=rr, column=1, value=text).font = Font(bold=True, size=12)
+        rr += 1
+        for j, h in enumerate(cols, start=1):
+            c = ck.cell(row=rr, column=j, value=h)
+            c.font, c.fill = bold, head_fill
+        rr += 1
+
+    def line(values, result_col=None, ok=True):
+        nonlocal rr
+        for j, v in enumerate(values, start=1):
+            ck.cell(row=rr, column=j, value=v)
+        if result_col:
+            ck.cell(row=rr, column=result_col).font = green if ok else red
+        rr += 1
+
+    heading("1. Each tab", ["Tab", "Result", "Detail"])
+    for typ in ("BS", "PL", "CF"):
+        m = final[typ]
+        if m is None:
+            line([SHEET_NAMES[typ], "Not included", "no statement passed verification"], 2, False)
+        elif not m["ok"]:
+            line([SHEET_NAMES[typ], "Not included", "; ".join(m["issues"])], 2, False)
+        else:
+            figures, problems = readback[typ]
+            ok = not problems
+            detail = (f"{len(m['periods'])} years ({m['periods'][0]['label']} to {m['periods'][-1]['label']}), {sum(1 for x in m['rows'] if x['kind'] != 'heading')} lines; "
+                      "no repeated lines; every figure traced to its report; every year complete; totals and subtotals tie; "
+                      f"all {figures} figures read back from this file and matched") if ok else "; ".join(problems[:5])
+            line([SHEET_NAMES[typ], "Pass" if ok else "FAIL", detail], 2, ok)
+
+    heading("2. Where each statement came from", ["Report", "Statement", "Taken from", "Unit in report", "Years", "Verified", "Detail"])
     for fname, rep in reports:
         sts = [s for s in rep["statements"] if s["basis"] == basis]
         if not sts:
-            summary_row([fname, "—", "", "", "", "", "", f"No {basis.lower()} statements found in this report"])
-            continue
+            line([fname, "—", "", "", "", "No", f"no {basis.lower()} statements found in this report"], 6, False)
         for st in sts:
-            if not st["verified"]:
-                why = "; ".join(f"{x['name'].lower()} ({x['detail']})" for x in st["verification"] if not x["ok"])
-                summary_row([fname, st["name"], "Not included", st["where"], "", "", "No", "Failed verification: " + why], True)
-                continue
-            m = combine([(fname, st)], out_unit, st["type"])
-            if not m["ok"]:
-                summary_row([fname, st["name"], "Not included", st["where"], "", "", "No", "Failed final check: " + "; ".join(m["issues"])], True)
-                continue
-            v = view(st, out_unit)
-            ws = wb.create_sheet(safe_name(f"{fname[:12]} {SHORT[st['type']]}" if len(reports) > 1 else f"{basis[:4]} {SHORT[st['type']]}"))
-            write_table(ws, f"{basis} {st['name']}", f"Units: {v['unitText']}{' (' + v['note'] + ')' if v['note'] else ''} · source: {fname}, {st['where']}", m, True)
             u = unit_of(st)
-            summary_row([fname, st["name"], ws.title, f"{st['where']}; located via the {st.get('foundVia', 'page scan')}",
-                         UNIT_LABEL[u] + (" (set by you)" if st.get("unitOverride") else "") if u else "not found",
-                         ", ".join(p["label"] for p in m["periods"]), "Yes", "; ".join(x["detail"] for x in st["verification"])])
-            for c in st["checks"]:
-                checks_rows.append([fname, st["name"], c["name"], c["period"], c["expected"], c["got"], c["diff"], "Pass" if c["ok"] else ("FAIL" if c["hard"] else "Review")])
-    ck = wb.create_sheet("Checks")
-    for j, h in enumerate(["Report", "Statement", "Check", "Year", "Expected", "Extracted", "Difference", "Result"], start=1):
-        c = ck.cell(row=1, column=j, value=h)
-        c.font, c.fill = bold, head_fill
-    for i, row in enumerate(checks_rows, start=2):
-        for j, val in enumerate(row, start=1):
-            ck.cell(row=i, column=j, value=val)
-    for j, w in enumerate([22, 16, 52, 10, 16, 16, 12, 10], start=1):
+            detail = "; ".join(x["detail"] for x in st["verification"] if (x["ok"] if st["verified"] else not x["ok"]))
+            line([fname, SHEET_NAMES[st["type"]], f"{st['where']} (via the {st.get('foundVia', 'page scan')})",
+                  (UNIT_LABEL[u] + (" (set by you)" if st.get("unitOverride") else "")) if u else "not found",
+                  ", ".join(p["label"] for p in sorted(st["periods"], key=date_key)), "Yes" if st["verified"] else "No",
+                  detail if st["verified"] else "left out: " + detail], 6, st["verified"])
+
+    heading("3. Totals in each report, as printed", ["Report", "Statement", "Check", "Year", "Expected", "Extracted", "Difference", "Result"])
+    for fname, rep in reports:
+        for st in rep["statements"]:
+            if st["basis"] != basis:
+                continue
+            for c in sorted(st["checks"], key=lambda c: (c["name"], c["period"])):
+                res = "Pass" if c["ok"] else ("FAIL" if c["hard"] else "Review")
+                line([fname, SHEET_NAMES[st["type"]], c["name"], c["period"], c["expected"], c["got"], c["diff"], res], 8, c["ok"])
+    for j, w in enumerate([24, 20, 52, 16, 16, 12, 70, 10], start=1):
         ck.column_dimensions[get_column_letter(j)].width = w
+    for row in ck.iter_rows(min_row=4):
+        for c in row:
+            if c.column in (5, 6, 7) and isinstance(c.value, float):
+                c.number_format = "#,##0.00;(#,##0.00);0.00"
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -1194,7 +1248,8 @@ div[data-testid="stFileUploader"] {max-width: 560px; margin: 0 auto;}
 </style>
 """
 
-TYPE_TABS = {"BS": "Balance Sheet", "PL": "Profit & Loss", "CF": "Cash Flow"}
+CODE_VERSION = hashlib.sha1(open(__file__, "rb").read()).hexdigest()[:12]  # changes with every update of this file
+TYPE_TABS = {"BS": "Balance Sheet", "PL": "Income Statement", "CF": "Cash Flow Statement"}
 UNIT_TABS = {"crore": "₹ Crore", "million": "₹ Million", "reported": "As reported"}
 
 
@@ -1235,6 +1290,16 @@ def table_html(m, unit, unit_text):
     return "".join(h)
 
 
+def keep_choice(key):
+    """Clicking the option that is already selected would clear it; keep it selected instead."""
+    import streamlit as st
+    ss = st.session_state
+    if ss.get(key) is None:
+        ss[key] = ss.get(f"_{key}_last")
+    else:
+        ss[f"_{key}_last"] = ss[key]
+
+
 def main():
     import streamlit as st
 
@@ -1250,7 +1315,7 @@ def main():
         return
 
     @st.cache_data(show_spinner=False, max_entries=24)
-    def cached_analyze(data: bytes, name: str):
+    def cached_analyze(data: bytes, name: str, code_version: str):
         return analyze(data, name)
 
     ss = st.session_state
@@ -1265,7 +1330,7 @@ def main():
         name = re.sub(r"\.pdf$", "", f.name, flags=re.I)
         bar.progress(i / len(files), text=f"Reading {name}…")
         try:
-            rep = cached_analyze(data, f.name)
+            rep = cached_analyze(data, f.name, CODE_VERSION)
         except Exception as exc:  # unreadable or encrypted PDF
             st.error(f"{name}: could not read this PDF ({exc}).")
             continue
@@ -1296,9 +1361,11 @@ def main():
 
     c1, c2, c3 = st.columns([1.1, 1.3, 1], vertical_alignment="center")
     with c1:
-        basis = st.segmented_control("Statements", ["Consolidated", "Standalone"], default=default_basis, key="basis", label_visibility="collapsed") or default_basis
+        basis = st.segmented_control("Statements", ["Consolidated", "Standalone"], default=default_basis, key="basis", label_visibility="collapsed",
+                                     on_change=keep_choice, args=("basis",)) or default_basis
     with c2:
-        out_unit = st.segmented_control("Units", list(UNIT_TABS), default="crore", format_func=UNIT_TABS.get, key="unit", label_visibility="collapsed") or "crore"
+        out_unit = st.segmented_control("Units", list(UNIT_TABS), default="crore", format_func=UNIT_TABS.get, key="unit", label_visibility="collapsed",
+                                        on_change=keep_choice, args=("unit",)) or "crore"
 
     verified_n = sum(1 for r in reports for s in r["statements"] if s["basis"] == basis and s["verified"])
     left_n = sum(1 for r in reports for s in r["statements"] if s["basis"] == basis and not s["verified"])
@@ -1322,7 +1389,8 @@ def main():
     elif verified_n:
         st.markdown('<p class="fse-status">Every statement was checked against the report.</p>', unsafe_allow_html=True)
 
-    typ = st.segmented_control("Statement", list(TYPE_TABS), default="BS", format_func=TYPE_TABS.get, key="type", label_visibility="collapsed") or "BS"
+    typ = st.segmented_control("Statement", list(TYPE_TABS), default="BS", format_func=TYPE_TABS.get, key="type", label_visibility="collapsed",
+                               on_change=keep_choice, args=("type",)) or "BS"
 
     items = [(r["name"], s) for r in reports for s in r["statements"] if s["basis"] == basis and s["type"] == typ and s["verified"]]
     if not items:
