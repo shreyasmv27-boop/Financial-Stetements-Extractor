@@ -90,9 +90,24 @@ def median(a):
 NOTE_TAIL = re.compile(r"\s+(?:note\s*)?\d{1,2}(?:\.\d{1,2})?\s?(?:\([a-z]{1,3}\)|[a-z])?(?:\s*(?:,|&|and)\s*\d{1,2}(?:\.\d{1,2})?\s?(?:\([a-z]{1,3}\))?)*$", re.I)
 
 
+# "increase / (decrease)" and "(decrease) / increase" name the same line: each pair maps to its first word
+ALT_PAIRS = [("generated from", "used in"), ("proceeds from", "repayment of"), ("increase", "decrease"), ("profit", "loss"),
+             ("gain", "loss"), ("inflow", "outflow"), ("generated", "used"), ("proceeds", "repayment"), ("surplus", "deficit"),
+             ("income", "expenses"), ("income", "expense"), ("credit", "charge"), ("receipts", "payments")]
+_ALT_RX = []
+for _a, _b in ALT_PAIRS:
+    _pa, _pb = _a.replace(" ", r"\s+"), _b.replace(" ", r"\s+")
+    for _x, _y in ((_pa, _pb), (_pb, _pa)):
+        _ALT_RX.append((re.compile(r"\(?\b" + _x + r"\b\)?\s*/\s*\(?\b" + _y + r"\b\)?"), _a))
+
+
 def norm_label(s: str) -> str:
-    """Canonical form of a line name: no '(a)'/'(i)'/'A.' prefixes, no note numbers, no punctuation."""
+    """Canonical form of a line name: no '(a)'/'(i)'/'A.' prefixes, no note numbers, no punctuation,
+    and 'X / (Y)' alternatives read the same whichever way round the report prints them."""
     s = s.lower().strip()
+    for rx, canon in _ALT_RX:
+        s = rx.sub(canon, s)
+    s = re.sub(r"^net\s+(increase|decrease|change|movement)\b", "net change", s)
     s = re.sub(r"^[-–•*]\s*", "", s)
     for _ in range(2):
         s = re.sub(r"^\(?(?:[ivx]{1,4}|[a-z]|\d{1,2})[).]\s+", "", s)
@@ -915,7 +930,9 @@ def merge_years(items, out_unit):
         a = rows[i]
         for j in range(i + 1, min(i + 4, len(rows))):
             b = rows[j]
-            if b["kind"] == a["kind"] and norm_label(b["label"]) == norm_label(a["label"]) and not (set(a["vals"]) & set(b["vals"])):
+            same_name = norm_label(b["label"]) == norm_label(a["label"])
+            if b["kind"] == a["kind"] and ((same_name and not (set(a["vals"]) & set(b["vals"]))) or
+                                          (split_pair(a, b) and name_similarity(a["label"], b["label"]) >= 0.6)):
                 a["vals"].update(b["vals"]); a["restated"].update(b["restated"]); a["files"] |= b["files"]
                 if len(b["label"]) < len(a["label"]) and a["kind"] != "heading":
                     a["label"] = b["label"]
@@ -941,6 +958,22 @@ def merge_years(items, out_unit):
     m = {"periods": periods, "rows": rows, "units": units, "files": [x["file"] for x in views],
          "decimals": max(x["v"]["decimals"] for x in views), "sources": sources, "tol_scale": scale}
     return m
+
+
+def split_pair(a, b):
+    """Two rows that look like one line under two names: they agree on every year they share (and it isn't all zero),
+    and each has years the other lacks."""
+    shared = set(a["vals"]) & set(b["vals"])
+    if not shared or not (set(a["vals"]) - set(b["vals"])) or not (set(b["vals"]) - set(a["vals"])):
+        return False
+    if any(abs(a["vals"][k]["v"] - b["vals"][k]["v"]) > 0.011 for k in shared):
+        return False
+    return any(abs(a["vals"][k]["v"]) > 1e-9 for k in shared)
+
+
+def name_similarity(x, y):
+    a, b = set(norm_label(x).split()), set(norm_label(y).split())
+    return len(a & b) / max(1, len(a | b))
 
 
 def cell(m, row, i):
@@ -981,6 +1014,11 @@ def integrity(m, typ):
             said = m.get("sources", {}).get(c["file"], {}).get((norm_label(r["label"]), p["key"]))
             if said is None or not any(abs(v - c["v"]) < 0.011 for v in said):
                 issues.append(f"{p['label']} figure for \"{r['label']}\" ({c['v']:g}) doesn't match that line in {c['file']}")
+    body = [r for r in m["rows"] if r["kind"] != "heading"]
+    for i, a in enumerate(body):
+        for b in body[i + 1:i + 4]:
+            if split_pair(a, b):
+                issues.append(f"\"{a['label']}\" and \"{b['label']}\" look like one line split in two (same figure for the year they share)")
     rx, name = KEY_LINES[typ]
     key_rows = [r for r in m["rows"] if r["kind"] != "heading" and re.search(rx, norm_label(r["label"]))]
     for p in m["periods"]:
