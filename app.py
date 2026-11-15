@@ -1028,12 +1028,6 @@ def report_differences(m):
     return out
 
 
-def diff_periods(m):
-    """Years that need an extra 'as first reported' column, oldest first."""
-    keys = {d["period"]["key"] for d in m.get("diffs", [])}
-    return [p for p in m["periods"] if p["key"] in keys]
-
-
 def split_pair(a, b):
     """Two rows that are one line printed under two names: no single report contains both, they agree on every year
     they share, and the shared figures aren't all zero."""
@@ -1182,10 +1176,7 @@ def build_workbook(reports, out_unit, basis) -> bytes:
         ws["A2"] = f"Units: {unit} · from {', '.join(m['files'])} · 0 means the report shows no figure for that year"
         ws["A2"].font = Font(italic=True, color="FF6E6E73")
         first = 2 + (1 if has_note else 0)
-        dps = diff_periods(m)
-        hdr = (["Particulars"] + (["Note"] if has_note else []) + [p["label"] for p in m["periods"]]
-               + [h for p in dps for h in (f"{p['label']} as first reported", f"{p['label']}: why it differs")])
-        extra = first + len(m["periods"])        # first column of the 'as first reported' pairs
+        hdr = ["Particulars"] + (["Note"] if has_note else []) + [p["label"] for p in m["periods"]]
         for j, h in enumerate(hdr, start=1):
             c = ws.cell(row=4, column=j, value=h)
             c.font, c.fill = bold, head_fill
@@ -1211,29 +1202,15 @@ def build_workbook(reports, out_unit, basis) -> bytes:
                     dd = row.get("diffs", {}).get(p["key"])
                     if dd and dd["big"]:
                         c.fill = flag_fill
-                for n, p in enumerate(dps):
-                    dd = row.get("diffs", {}).get(p["key"])
-                    if not dd:
-                        continue
-                    c = ws.cell(row=r, column=extra + 2 * n, value=dd["old"])
-                    c.number_format = fmt(d)
-                    w = ws.cell(row=r, column=extra + 2 * n + 1, value=f"As printed in the {dd['old_file']} report. " + dd["reason"][0].upper() + dd["reason"][1:] + ".")
-                    w.alignment = Alignment(wrap_text=True, vertical="top")
-                    if dd["big"]:
-                        c.fill = w.fill = flag_fill
-                        w.font = Font(color="FFB42318")
             r += 1
         if has_note:
             ws.column_dimensions["B"].width = 8
         for j in range(first, len(hdr) + 1):
             ws.column_dimensions[get_column_letter(j)].width = 14
-        for n in range(len(dps)):
-            ws.column_dimensions[get_column_letter(extra + 2 * n)].width = 16
-            ws.column_dimensions[get_column_letter(extra + 2 * n + 1)].width = 48
-        if dps:
+        if m["diffs"]:
             big_n = sum(1 for dd in m["diffs"] if dd["big"])
-            ws["A3"] = (f"{len(m['diffs'])} figure{'s' if len(m['diffs']) != 1 else ''} differ between reports; the latest report's figure is used and the older one is shown "
-                        f"on the right with the reason." + (f" {big_n} differ by more than 5% and are highlighted." if big_n else " All are within 5%."))
+            ws["A3"] = (f"Where reports differ for the same year, the latest report's figure is used ({len(m['diffs'])} figure{'s' if len(m['diffs']) != 1 else ''}; see the Checks tab)."
+                        + (f" {big_n} changed by more than 5% and {'are' if big_n != 1 else 'is'} highlighted." if big_n else ""))
             ws["A3"].font = Font(italic=True, color="FFB42318" if big_n else "FF6E6E73")
         ws.freeze_panes = ws.cell(row=5, column=first)
         written[typ] = (ws, m, first)
@@ -1389,9 +1366,6 @@ html, body, [class*="css"] {font-family: -apple-system, BlinkMacSystemFont, "SF 
 .fse-table tr.t td {font-weight: 600; border-top: 1px solid rgba(127,127,127,.35);}
 .fse-table tr.i td:first-child {padding-left: 14px;}
 .fse-table td.y {color: #8e8e93;}
-.fse-table th.dh {color: #b42318;}
-.fse-table .dh {border-left: 1px solid rgba(127,127,127,.25);}
-.fse-table td.dr, .fse-table th.dr {white-space: normal; min-width: 230px; text-align: left; font-size: 12.5px; color: #8e8e93;}
 .fse-table td.flag {background: rgba(215,0,21,.12); color: #d70015;}
 .fse-ok {color: #1a7f37; font-weight: 500;} .fse-no {color: #d70015; font-weight: 500;}
 .fse-src {font-size: 14px;}
@@ -1435,26 +1409,15 @@ def fmt_num(v, d, unit):
 def table_html(m, unit, unit_text):
     e = html.escape
     np_ = len(m["periods"])
-    dps = diff_periods(m)
-    head = "".join(f"<th>{e(p['label'])}</th>" for p in m["periods"])
-    head += "".join(f'<th class="dh">{e(p["label"])} as first reported</th><th class="dh dr">Why it differs</th>' for p in dps)
-    h = [f'<table class="fse-table"><thead><tr><th>{e(unit_text)}</th>{head}</tr></thead><tbody>']
+    h = [f'<table class="fse-table"><thead><tr><th>{e(unit_text)}</th>' + "".join(f"<th>{e(p['label'])}</th>" for p in m["periods"]) + "</tr></thead><tbody>"]
     for r in m["rows"]:
         if r["kind"] == "heading":
-            h.append(f'<tr class="h"><td colspan="{np_ + 1 + 2 * len(dps)}">{e(r["label"])}</td></tr>')
+            h.append(f'<tr class="h"><td colspan="{np_ + 1}">{e(r["label"])}</td></tr>')
             continue
         d = 2 if r["noConvert"] else m["decimals"]
         diffs = r.get("diffs", {})
         cells = "".join(f'<td class="{"flag" if diffs.get(p["key"], {}).get("big") else ""}">{fmt_num(cell(m, r, i), d, unit)}</td>'
                         for i, p in enumerate(m["periods"]))
-        for p in dps:
-            dd = diffs.get(p["key"])
-            if dd:
-                cls = "flag" if dd["big"] else ""
-                why = f"{dd['old_file']} report showed this; {dd['new_file']} restated it by {dd['pct']:+.1%}" + (". Check the notes." if dd["big"] else ".")
-                cells += f'<td class="dh {cls}">{fmt_num(dd["old"], d, unit)}</td><td class="dr {cls}">{e(why)}</td>'
-            else:
-                cells += '<td class="dh"></td><td class="dr"></td>'
         h.append(f'<tr class="{"t" if r["kind"] == "total" else "i"}"><td>{e(r["label"])}</td>{cells}</tr>')
     h.append("</tbody></table>")
     return "".join(h)
@@ -1579,9 +1542,10 @@ def main():
                 ut = vv["unitText"] + (" (" + vv["note"] + ")" if vv["note"] else "")
             if m["diffs"]:
                 big_n = sum(1 for dd in m["diffs"] if dd["big"])
-                msg = (f"{len(m['diffs'])} figure{'s' if len(m['diffs']) != 1 else ''} differ between reports. The latest report's figure is used; "
-                       "the older one and the reason are on the right. ")
-                msg += f"{big_n} differ by more than 5% and are highlighted." if big_n else "All are within 5%."
+                msg = (f"Where reports differ for the same year, the latest report's figure is shown "
+                       f"({len(m['diffs'])} figure{'s' if len(m['diffs']) != 1 else ''}). ")
+                msg += (f"{big_n} changed by more than 5% and {'are' if big_n != 1 else 'is'} highlighted; details in the Checks tab of the Excel."
+                        if big_n else "All are within 5%.")
                 st.markdown(f'<p class="fse-status{" bad" if big_n else ""}">{html.escape(msg)}</p>', unsafe_allow_html=True)
             st.markdown(f'<div class="fse-card">{table_html(m, unit, ut)}</div>', unsafe_allow_html=True)
 
