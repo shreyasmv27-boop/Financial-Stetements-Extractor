@@ -454,6 +454,9 @@ def detect_unit(text):
     return None
 
 
+MAJOR_RE = re.compile(r"^(non current assets|current assets|non current liabilities|current liabilities|equity|assets|liabilities|"
+                      r"equity and liabilities|capital and liabilities|income|expenses|expenditure|revenue|tax expense)$|"
+                      r"operating activities|investing activities|financing activities")
 UMBRELLA = {"assets", "liabilities", "equity and liabilities", "liabilities and equity", "capital and liabilities", "equity and liabilities"}
 
 
@@ -628,11 +631,14 @@ def parse_statement(pages_data, typ, fy_hint):
         out["rows"].extend(r for r in merged if r["label"] or r["hasVals"])
     out["unit"] = unit
     name_unlabelled_totals(out["rows"])
-    section, seen = "", Counter()
+    section, major, seen = "", "", Counter()
     for r in out["rows"]:
         if r["kind"] == "heading":
             section = norm_label(r["label"])
-        base = (section + "|" + norm_label(r["label"]))[:160]
+            if MAJOR_RE.search(section):
+                major = section
+        r["major"] = major
+        base = (major + "|" + section + "|" + norm_label(r["label"]))[:200]
         seen[base] += 1
         r["key"] = base + (f"#{seen[base]}" if seen[base] > 1 else "")
         r["noConvert"] = bool(NO_CONVERT.search(r["label"]) or (re.search(r"earnings?\s+per", section) and r["kind"] != "heading"))
@@ -922,6 +928,14 @@ def merge_years(items, out_unit):
                 periods.append({**p, "key": k, "header": "" if p.get("inferred") else p.get("header", "")})
     periods.sort(key=date_key)  # oldest on the left, latest on the right
 
+    # printed reports round each line; the allowed rounding gap grows when figures are converted to a larger number
+    scale = 1.0
+    for f, st in items:
+        src = unit_of(st)
+        factor = UNIT_FACTORS[src] / UNIT_FACTORS[out_unit] if (out_unit != "reported" and src) else 1.0
+        scale = max(scale, factor * 10 ** (2 - st["decimals"]))
+    rounding = 0.011 * scale
+
     rows, idx, by_label = [], {}, {}
     for x in views:
         last_pos = -1
@@ -931,13 +945,14 @@ def merge_years(items, out_unit):
             if m is not None and x["file"] in m["files"]:
                 m = None
             if m is None:  # same line under a slightly different heading or name in another year
-                cands = [c for c in by_label.get(nl, []) if x["file"] not in c["files"] and c["kind"] == r["kind"]]
+                cands = [c for c in by_label.get(nl, []) if x["file"] not in c["files"] and c["kind"] == r["kind"]
+                         and c.get("major", "") == r.get("major", "")]
                 if cands:
                     after = [c for c in cands if rows.index(c) > last_pos]
                     m = (after or cands)[0]
             if m is None:
                 m = {"label": r["label"], "note": r["note"], "kind": r["kind"], "key": r["key"], "noConvert": r["noConvert"],
-                     "vals": {}, "restated": {}, "files": set(), "aliases": set()}
+                     "major": r.get("major", ""), "vals": {}, "restated": {}, "files": set(), "aliases": set()}
                 rows.insert(last_pos + 1, m)
                 idx[r["key"]] = m
                 by_label.setdefault(nl, []).append(m)
@@ -948,9 +963,9 @@ def merge_years(items, out_unit):
                 if not c:
                     continue
                 if k not in m["vals"]:
-                    m["vals"][k] = {"v": c["v"], "file": x["file"]}
-                elif abs(m["vals"][k]["v"] - c["v"]) > 0.011:
-                    m["restated"][k] = {"v": c["v"], "file": x["file"]}
+                    m["vals"][k] = {"v": c["v"], "file": x["file"]}          # reports are read latest first, so this is the latest figure
+                elif abs(m["vals"][k]["v"] - c["v"]) > rounding and k not in m["restated"]:
+                    m["restated"][k] = {"v": c["v"], "file": x["file"]}      # what an older report printed for the same year
 
     # the same line split across two rows (one per set of years) is joined into one, worded as in the latest report
     order = {x["file"]: n for n, x in enumerate(views)}
@@ -982,15 +997,41 @@ def merge_years(items, out_unit):
             for c, k in zip(r["vals"], x["keys"]):
                 if c:
                     src.setdefault((norm_label(r["label"]), k), []).append(c["v"])
-    # printed reports round each line; the allowed rounding gap grows when figures are converted to a larger number
-    scale = 1.0
-    for f, st in items:
-        src = unit_of(st)
-        factor = UNIT_FACTORS[src] / UNIT_FACTORS[out_unit] if (out_unit != "reported" and src) else 1.0
-        scale = max(scale, factor * 10 ** (2 - st["decimals"]))
     m = {"periods": periods, "rows": rows, "units": units, "files": [x["file"] for x in views],
          "decimals": max(x["v"]["decimals"] for x in views), "sources": sources, "tol_scale": scale}
+    m["diffs"] = report_differences(m)
     return m
+
+
+DIFF_LIMIT = 0.05   # up to 5% between two reports is accepted; more than that is highlighted
+
+
+def report_differences(m):
+    """Every line and year where an older report printed a different figure from the latest one.
+    The latest figure is always the one used; the older one is shown beside it with the reason."""
+    out = []
+    for r in m["rows"]:
+        for p in m["periods"]:
+            old = r["restated"].get(p["key"])
+            new = r["vals"].get(p["key"])
+            if not old or not new:
+                continue
+            base = abs(new["v"]) if abs(new["v"]) > 1e-9 else abs(old["v"])
+            pct = (new["v"] - old["v"]) / base if base > 1e-9 else 0.0
+            big = abs(pct) > DIFF_LIMIT
+            reason = (f"{new['file']} report restated this from {old['v']:,.2f} to {new['v']:,.2f} ({pct:+.1%}); latest figure used"
+                      + ("; more than 5%, check the notes in the latest report" if big else "; within 5%"))
+            d = {"row": r, "period": p, "new": new["v"], "new_file": new["file"], "old": old["v"], "old_file": old["file"],
+                 "pct": pct, "big": big, "reason": reason}
+            r.setdefault("diffs", {})[p["key"]] = d
+            out.append(d)
+    return out
+
+
+def diff_periods(m):
+    """Years that need an extra 'as first reported' column, oldest first."""
+    keys = {d["period"]["key"] for d in m.get("diffs", [])}
+    return [p for p in m["periods"] if p["key"] in keys]
 
 
 def split_pair(a, b):
@@ -1111,6 +1152,7 @@ def build_workbook(reports, out_unit, basis) -> bytes:
     red, green = Font(bold=True, color="FFD70015"), Font(bold=True, color="FF1A7F37")
     top_line = Border(top=Side(style="thin", color="FF1D1D1F"))
     head_fill = PatternFill("solid", fgColor="FFF5F5F7")
+    flag_fill = PatternFill("solid", fgColor="FFFDE2E1")
     out_label = "as reported" if out_unit == "reported" else UNIT_LABEL[out_unit]
 
     def fmt(d):
@@ -1140,7 +1182,10 @@ def build_workbook(reports, out_unit, basis) -> bytes:
         ws["A2"] = f"Units: {unit} · from {', '.join(m['files'])} · 0 means the report shows no figure for that year"
         ws["A2"].font = Font(italic=True, color="FF6E6E73")
         first = 2 + (1 if has_note else 0)
-        hdr = ["Particulars"] + (["Note"] if has_note else []) + [p["label"] for p in m["periods"]]
+        dps = diff_periods(m)
+        hdr = (["Particulars"] + (["Note"] if has_note else []) + [p["label"] for p in m["periods"]]
+               + [h for p in dps for h in (f"{p['label']} as first reported", f"{p['label']}: why it differs")])
+        extra = first + len(m["periods"])        # first column of the 'as first reported' pairs
         for j, h in enumerate(hdr, start=1):
             c = ws.cell(row=4, column=j, value=h)
             c.font, c.fill = bold, head_fill
@@ -1163,14 +1208,33 @@ def build_workbook(reports, out_unit, basis) -> bytes:
                         c.font = bold
                     if row["kind"] == "total":
                         c.border = top_line
-                    rs = row["restated"].get(p["key"])
-                    if rs:
-                        c.comment = Comment(f"Shown as {rs['v']} in {rs['file']}. The newer report's figure is used here.", "Extractor")
+                    dd = row.get("diffs", {}).get(p["key"])
+                    if dd and dd["big"]:
+                        c.fill = flag_fill
+                for n, p in enumerate(dps):
+                    dd = row.get("diffs", {}).get(p["key"])
+                    if not dd:
+                        continue
+                    c = ws.cell(row=r, column=extra + 2 * n, value=dd["old"])
+                    c.number_format = fmt(d)
+                    w = ws.cell(row=r, column=extra + 2 * n + 1, value=f"As printed in the {dd['old_file']} report. " + dd["reason"][0].upper() + dd["reason"][1:] + ".")
+                    w.alignment = Alignment(wrap_text=True, vertical="top")
+                    if dd["big"]:
+                        c.fill = w.fill = flag_fill
+                        w.font = Font(color="FFB42318")
             r += 1
         if has_note:
             ws.column_dimensions["B"].width = 8
         for j in range(first, len(hdr) + 1):
             ws.column_dimensions[get_column_letter(j)].width = 14
+        for n in range(len(dps)):
+            ws.column_dimensions[get_column_letter(extra + 2 * n)].width = 16
+            ws.column_dimensions[get_column_letter(extra + 2 * n + 1)].width = 48
+        if dps:
+            big_n = sum(1 for dd in m["diffs"] if dd["big"])
+            ws["A3"] = (f"{len(m['diffs'])} figure{'s' if len(m['diffs']) != 1 else ''} differ between reports; the latest report's figure is used and the older one is shown "
+                        f"on the right with the reason." + (f" {big_n} differ by more than 5% and are highlighted." if big_n else " All are within 5%."))
+            ws["A3"].font = Font(italic=True, color="FFB42318" if big_n else "FF6E6E73")
         ws.freeze_panes = ws.cell(row=5, column=first)
         written[typ] = (ws, m, first)
 
@@ -1237,7 +1301,9 @@ def build_workbook(reports, out_unit, basis) -> bytes:
             ok = not problems
             detail = (f"{len(m['periods'])} years ({m['periods'][0]['label']} to {m['periods'][-1]['label']}), {sum(1 for x in m['rows'] if x['kind'] != 'heading')} lines; "
                       "no repeated lines; every figure traced to its report; every year complete; totals and subtotals tie; "
-                      f"all {figures} figures read back from this file and matched") if ok else "; ".join(problems[:5])
+                      f"all {figures} figures read back from this file and matched"
+                      + (f"; {len(m['diffs'])} figures differ between reports ({sum(1 for dd in m['diffs'] if dd['big'])} by more than 5%), latest used"
+                         if m["diffs"] else "")) if ok else "; ".join(problems[:5])
             line([SHEET_NAMES[typ], "Pass" if ok else "FAIL", detail], 2, ok)
 
     heading("2. Where each statement came from", ["Report", "Statement", "Taken from", "Unit in report", "Years", "Verified", "Detail"])
@@ -1261,6 +1327,19 @@ def build_workbook(reports, out_unit, basis) -> bytes:
             for c in sorted(st["checks"], key=lambda c: (c["name"], c["period"])):
                 res = "Pass" if c["ok"] else ("FAIL" if c["hard"] else "Review")
                 line([fname, SHEET_NAMES[st["type"]], c["name"], c["period"], c["expected"], c["got"], c["diff"], res], 8, c["ok"])
+    heading("4. Figures that differ between reports (latest report used)",
+            ["Statement", "Line", "Year", "Latest report", "Latest figure", "Older figure", "Older report and reason", "Result"])
+    any_diff = False
+    for typ in ("BS", "PL", "CF"):
+        m = final[typ]
+        if not m or not m["ok"]:
+            continue
+        for dd in m["diffs"]:
+            any_diff = True
+            line([SHEET_NAMES[typ], dd["row"]["label"], dd["period"]["label"], dd["new_file"], dd["new"], dd["old"],
+                  f"{dd['old_file']}: {dd['reason']}", "More than 5%" if dd["big"] else "Within 5%"], 8, not dd["big"])
+    if not any_diff:
+        line(["No figure differs between reports."])
     for j, w in enumerate([24, 20, 52, 16, 16, 12, 70, 10], start=1):
         ck.column_dimensions[get_column_letter(j)].width = w
     for row in ck.iter_rows(min_row=4):
@@ -1310,6 +1389,10 @@ html, body, [class*="css"] {font-family: -apple-system, BlinkMacSystemFont, "SF 
 .fse-table tr.t td {font-weight: 600; border-top: 1px solid rgba(127,127,127,.35);}
 .fse-table tr.i td:first-child {padding-left: 14px;}
 .fse-table td.y {color: #8e8e93;}
+.fse-table th.dh {color: #b42318;}
+.fse-table .dh {border-left: 1px solid rgba(127,127,127,.25);}
+.fse-table td.dr, .fse-table th.dr {white-space: normal; min-width: 230px; text-align: left; font-size: 12.5px; color: #8e8e93;}
+.fse-table td.flag {background: rgba(215,0,21,.12); color: #d70015;}
 .fse-ok {color: #1a7f37; font-weight: 500;} .fse-no {color: #d70015; font-weight: 500;}
 .fse-src {font-size: 14px;}
 .fse-why {color: #8e8e93; font-size: 13px; margin: 2px 0 6px;}
@@ -1352,14 +1435,27 @@ def fmt_num(v, d, unit):
 def table_html(m, unit, unit_text):
     e = html.escape
     np_ = len(m["periods"])
-    h = [f'<table class="fse-table"><thead><tr><th>{e(unit_text)}</th>' + "".join(f"<th>{e(p['label'])}</th>" for p in m["periods"]) + "</tr></thead><tbody>"]
+    dps = diff_periods(m)
+    head = "".join(f"<th>{e(p['label'])}</th>" for p in m["periods"])
+    head += "".join(f'<th class="dh">{e(p["label"])} as first reported</th><th class="dh dr">Why it differs</th>' for p in dps)
+    h = [f'<table class="fse-table"><thead><tr><th>{e(unit_text)}</th>{head}</tr></thead><tbody>']
     for r in m["rows"]:
         if r["kind"] == "heading":
-            h.append(f'<tr class="h"><td colspan="{np_ + 1}">{e(r["label"])}</td></tr>')
+            h.append(f'<tr class="h"><td colspan="{np_ + 1 + 2 * len(dps)}">{e(r["label"])}</td></tr>')
             continue
         d = 2 if r["noConvert"] else m["decimals"]
-        h.append(f'<tr class="{"t" if r["kind"] == "total" else "i"}"><td>{e(r["label"])}</td>'
-                 + "".join(f"<td>{fmt_num(cell(m, r, i), d, unit)}</td>" for i in range(np_)) + "</tr>")
+        diffs = r.get("diffs", {})
+        cells = "".join(f'<td class="{"flag" if diffs.get(p["key"], {}).get("big") else ""}">{fmt_num(cell(m, r, i), d, unit)}</td>'
+                        for i, p in enumerate(m["periods"]))
+        for p in dps:
+            dd = diffs.get(p["key"])
+            if dd:
+                cls = "flag" if dd["big"] else ""
+                why = f"{dd['old_file']} report showed this; {dd['new_file']} restated it by {dd['pct']:+.1%}" + (". Check the notes." if dd["big"] else ".")
+                cells += f'<td class="dh {cls}">{fmt_num(dd["old"], d, unit)}</td><td class="dr {cls}">{e(why)}</td>'
+            else:
+                cells += '<td class="dh"></td><td class="dr"></td>'
+        h.append(f'<tr class="{"t" if r["kind"] == "total" else "i"}"><td>{e(r["label"])}</td>{cells}</tr>')
     h.append("</tbody></table>")
     return "".join(h)
 
@@ -1481,6 +1577,12 @@ def main():
             if len(items) == 1:
                 vv = view(items[0][1], out_unit)
                 ut = vv["unitText"] + (" (" + vv["note"] + ")" if vv["note"] else "")
+            if m["diffs"]:
+                big_n = sum(1 for dd in m["diffs"] if dd["big"])
+                msg = (f"{len(m['diffs'])} figure{'s' if len(m['diffs']) != 1 else ''} differ between reports. The latest report's figure is used; "
+                       "the older one and the reason are on the right. ")
+                msg += f"{big_n} differ by more than 5% and are highlighted." if big_n else "All are within 5%."
+                st.markdown(f'<p class="fse-status{" bad" if big_n else ""}">{html.escape(msg)}</p>', unsafe_allow_html=True)
             st.markdown(f'<div class="fse-card">{table_html(m, unit, ut)}</div>', unsafe_allow_html=True)
 
     # ---- sources: where each statement came from, and a way to fix it ----
