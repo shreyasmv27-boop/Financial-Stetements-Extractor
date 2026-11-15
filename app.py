@@ -454,6 +454,32 @@ def detect_unit(text):
     return None
 
 
+UMBRELLA = {"assets", "liabilities", "equity and liabilities", "liabilities and equity", "capital and liabilities", "equity and liabilities"}
+
+
+def name_unlabelled_totals(rows):
+    """Some reports print a subtotal with no name, just the figures under a block. It is named after the block it
+    closes ("Non-current assets" -> "Total non-current assets") so it lines up with years where the name is printed."""
+    block = []
+    for r in rows:
+        if r["kind"] == "heading":
+            block.append(r)
+            continue
+        if r["hasVals"] and not r["label"].strip():
+            h = next((x for x in block if norm_label(x["label"]) not in UMBRELLA), None)
+            if h:
+                name = h["label"].strip().rstrip(":").strip()
+                name = name.lower() if name.isupper() else name[:1].lower() + name[1:]
+                r["label"] = f"Total {name}"
+            else:
+                r["label"] = "Total"
+            r["kind"] = "total"
+            r["named"] = True
+            block = []
+        elif r["kind"] == "total":
+            block = []
+
+
 def is_total(label):
     l = re.sub(r"^([ivx]+|[a-z]|\d+)\.\s*|^\([a-z]+\)\s*", "", label, flags=re.I)
     return bool(re.match(r"^(total|net\s+(cash|increase|decrease|profit|loss)|profit|loss|cash\s+and\s+cash\s+equivalents\s+at\s+the\s+end|grand\s+total|sub[- ]?total)", l, re.I))
@@ -601,6 +627,7 @@ def parse_statement(pages_data, typ, fy_hint):
             r["kind"] = ("total" if is_total(r["label"]) else "item") if r["hasVals"] else "heading"
         out["rows"].extend(r for r in merged if r["label"] or r["hasVals"])
     out["unit"] = unit
+    name_unlabelled_totals(out["rows"])
     section, seen = "", Counter()
     for r in out["rows"]:
         if r["kind"] == "heading":
@@ -910,11 +937,12 @@ def merge_years(items, out_unit):
                     m = (after or cands)[0]
             if m is None:
                 m = {"label": r["label"], "note": r["note"], "kind": r["kind"], "key": r["key"], "noConvert": r["noConvert"],
-                     "vals": {}, "restated": {}, "files": set()}
+                     "vals": {}, "restated": {}, "files": set(), "aliases": set()}
                 rows.insert(last_pos + 1, m)
                 idx[r["key"]] = m
                 by_label.setdefault(nl, []).append(m)
             m["files"].add(x["file"])
+            m["aliases"].add(nl)
             last_pos = rows.index(m)
             for c, k in zip(r["vals"], x["keys"]):
                 if not c:
@@ -924,7 +952,8 @@ def merge_years(items, out_unit):
                 elif abs(m["vals"][k]["v"] - c["v"]) > 0.011:
                     m["restated"][k] = {"v": c["v"], "file": x["file"]}
 
-    # the same line split across two rows (one per set of years) is joined into one
+    # the same line split across two rows (one per set of years) is joined into one, worded as in the latest report
+    order = {x["file"]: n for n, x in enumerate(views)}
     i = 0
     while i < len(rows):
         a = rows[i]
@@ -932,10 +961,14 @@ def merge_years(items, out_unit):
             b = rows[j]
             same_name = norm_label(b["label"]) == norm_label(a["label"])
             if b["kind"] == a["kind"] and ((same_name and not (set(a["vals"]) & set(b["vals"]))) or
-                                          (split_pair(a, b) and name_similarity(a["label"], b["label"]) >= 0.6)):
-                a["vals"].update(b["vals"]); a["restated"].update(b["restated"]); a["files"] |= b["files"]
-                if len(b["label"]) < len(a["label"]) and a["kind"] != "heading":
+                                          (split_pair(a, b) and (name_similarity(a["label"], b["label"]) >= 0.6 or not a["label"].strip() or not b["label"].strip()))):
+                rank = lambda row: min((order[f] for f in row["files"]), default=99)   # 0 = latest report
+                if b["label"].strip() and (not a["label"].strip() or rank(b) < rank(a)):
                     a["label"] = b["label"]
+                for k, v in b["vals"].items():
+                    a["vals"].setdefault(k, v)
+                a["restated"].update(b["restated"]); a["files"] |= b["files"]
+                a["aliases"] |= b["aliases"]
                 del rows[j]
                 break
         else:
@@ -961,10 +994,12 @@ def merge_years(items, out_unit):
 
 
 def split_pair(a, b):
-    """Two rows that look like one line under two names: they agree on every year they share (and it isn't all zero),
-    and each has years the other lacks."""
+    """Two rows that are one line printed under two names: no single report contains both, they agree on every year
+    they share, and the shared figures aren't all zero."""
+    if a.get("files") and b.get("files") and (a["files"] & b["files"]):
+        return False
     shared = set(a["vals"]) & set(b["vals"])
-    if not shared or not (set(a["vals"]) - set(b["vals"])) or not (set(b["vals"]) - set(a["vals"])):
+    if not shared:
         return False
     if any(abs(a["vals"][k]["v"] - b["vals"][k]["v"]) > 0.011 for k in shared):
         return False
@@ -1011,8 +1046,9 @@ def integrity(m, typ):
             c = r["vals"].get(p["key"])
             if not c:
                 continue
-            said = m.get("sources", {}).get(c["file"], {}).get((norm_label(r["label"]), p["key"]))
-            if said is None or not any(abs(v - c["v"]) < 0.011 for v in said):
+            src = m.get("sources", {}).get(c["file"], {})
+            said = [v for alias in (r.get("aliases") or {norm_label(r["label"])}) for v in src.get((alias, p["key"]), [])]
+            if not said or not any(abs(v - c["v"]) < 0.011 for v in said):
                 issues.append(f"{p['label']} figure for \"{r['label']}\" ({c['v']:g}) doesn't match that line in {c['file']}")
     body = [r for r in m["rows"] if r["kind"] != "heading"]
     for i, a in enumerate(body):
