@@ -48,7 +48,8 @@ NO_CONVERT = re.compile(r"earnings?\s+per|per\s+(equity\s+)?share|\beps\b|^basic
 MONTH_RE = re.compile(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", re.I)
 UNIT_FACTORS = {"rupees": 1, "thousand": 1e3, "lakh": 1e5, "million": 1e6, "crore": 1e7, "billion": 1e9}
 UNIT_LABEL = {"rupees": "₹", "thousand": "₹ thousand", "lakh": "₹ lakh", "million": "₹ million", "crore": "₹ crore", "billion": "₹ billion"}
-PAT_RE = re.compile(r"^(net )?(profit|loss)( loss)?( for the (year|period)| after tax(es|ation)?)( from continuing operations)?$|^profit after tax")
+PAT_RE = re.compile(r"^(net )?(profit|loss)( loss)?( for the (year|period)| after tax(es|ation)?)( from continuing operations)?"
+                    r"( before (share of )?(non controlling|minority) interests?)?$|^profit after tax")
 AFTER_PAT = re.compile(r"other comprehensive|total comprehensive|earnings? per|attributable to|^owners|non controlling|appropriation")
 NET_CHANGE_RE = re.compile(r"^net (increase|decrease|change|movement|inflow|outflow).*\bcash\b")
 
@@ -101,6 +102,13 @@ for _a, _b in ALT_PAIRS:
         _ALT_RX.append((re.compile(r"\(?\b" + _x + r"\b\)?\s*/\s*\(?\b" + _y + r"\b\)?"), _a))
 
 
+_REF = r"(?:[ivxl]{1,5}|[a-h]|\d{1,2})"
+_TOK = r"\(?" + _REF + r"\)?"
+
+
+NAV = r"(statutory reports?|corporate overview|financial statements|integrated report|management reports?|board'?s? report|notice)"
+
+
 def norm_label(s: str) -> str:
     """Canonical form of a line name: no '(a)'/'(i)'/'A.' prefixes, no note numbers, no punctuation,
     and 'X / (Y)' alternatives read the same whichever way round the report prints them."""
@@ -110,7 +118,14 @@ def norm_label(s: str) -> str:
     s = re.sub(r"^net\s+(increase|decrease|change|movement)\b", "net change", s)
     s = re.sub(r"^[-–•*]\s*", "", s)
     for _ in range(2):
-        s = re.sub(r"^\(?(?:[ivx]{1,4}|[a-z]|\d{1,2})[).]\s+", "", s)
+        s = re.sub(r"^\(?(?:[ivx]{1,4}|[a-z]|\d{1,2})[).]\s*", "", s)
+        s = re.sub(r"^(?:[ivx]{1,4}|\d{1,2})\s+(?=[a-z(])", "", s)          # "VII Profit for the year", "5 Profit before tax"
+    s = re.sub(r"^(total|sub total|subtotal)\s*[-–:]\s*", r"\1 ", s)          # "Total - Equity" reads as "Total Equity"
+    for _ in range(3):                                                       # "(III - IV)", "(A+B+C)", "(VII)" printed after the name
+        s = re.sub(r"\s*[\(\[]\s*" + _TOK + r"(?:\s*[-+–−]\s*" + _TOK + r")*\s*[\)\]]\s*$", "", s)
+        s = re.sub(r"\s+\d{2,3}\s*[-–]\s*\d{2,3}$", "", s)                    # page ranges such as "353-354"
+        s = re.sub(r"\s+\d{1,2}\s*(?:\([a-z0-9]{1,3}\))?(?:\s*(?:,|&|and)\s*\d{1,2}\s*(?:\([a-z0-9]{1,3}\))?)+$", "", s)
+    s = re.sub(r"\s+" + NAV + r"$", "", s)                                 # a section tab from the page edge read into the line
     s = NOTE_TAIL.sub("", s)
     s = re.sub(r"/\s*\(?(loss|profit|decrease|increase|used in|generated from)\)?", "", s)
     s = re.sub(r"\((loss|profit)\)", "", s)
@@ -212,6 +227,18 @@ def to_rows(page):
     return rows
 
 
+def heading_text(page) -> str:
+    """Text above the first row of figures: the statement's own title block."""
+    out = []
+    for r in to_rows(page):
+        if r["y"] < page["H"] * 0.55:
+            break
+        if sum(1 for w in r["words"] if re.search(r"\d[,.]\d", w["s"]) and is_num(w["s"])) >= 1 and not MONTH_RE.search(r["text"]):
+            break
+        out.append(r["text"])
+    return " ".join(out).lower()
+
+
 def top_text(page, frac=0.3) -> str:
     ws = [w for w in page["words"] if w["y"] > page["H"] * (1 - frac)]
     ws.sort(key=lambda w: (-w["y"], w["x0"]))
@@ -309,6 +336,17 @@ def classify(pages, toc):
                 return r["basis"]
         return None
 
+    # the reporting company is the name printed most often in page headers; statements headed with another
+    # company's name (a subsidiary's balance sheet reproduced later in the report) are not this company's statements
+    names = Counter(m.strip() for pg in pages for m in re.findall(r"((?:[a-z&.()]+ ){1,4})limited", top_text(pg, 0.15)))
+    owner = names.most_common(1)[0][0] if names else ""
+
+    def other_entity(pg, typ):
+        head = heading_text(pg)
+        m = TYPES[typ]["title"].search(head)
+        pre = head[:m.start()] if m else ""
+        return bool(owner and re.search(r"\blimited\b|\bltd\b", pre) and owner not in pre)
+
     for pg in pages:
         top = top_text(pg)
         if EXCLUDE_TOP.search(top):
@@ -322,6 +360,8 @@ def classify(pages, toc):
             if typ == "BS" and TYPES["PL"]["title"].search(top) and not re.search(r"balance\s*sheet", top[:120]):
                 continue
             score = nums + 50
+            if other_entity(pg, typ):
+                score -= 200
             if re.search(r"as\s+at|year\s+ended|period\s+ended", top):
                 score += 15
             if re.search(r"particulars|\bnote", pg["text"]):
@@ -374,6 +414,8 @@ def parse_date(text, patterns=DATE_PATTERNS):
 
 def is_header_row(t):
     return bool(re.search(r"particulars|^\s*note|as\s+at|year\s+ended|period\s+ended|for\s+the\s+year", t, re.I)
+                or re.fullmatch(r"\s*((fy\s*)?(19|20)\d{2}(\s*[-–]\s*\d{2,4})?\s*)+", t, re.I)
+                or (re.search(r"\b\d{1,2},?\s+(19|20)\d{2}\b", t) and not re.search(r"\d,\d{2}", t) and len(t.split()) < 10)
                 or (re.search(_M + r"[a-z]*", t, re.I) and re.search(r"\b(19|20)\d{2}\b", t) and len(t.split(" ")) < 14))
 
 
@@ -431,8 +473,8 @@ def detect_report_year(pages, file_name):
 
 def detect_unit(text):
     t = text.lower()
-    U = r"(crores?|cr\b|lakhs?|lacs?|millions?|mn\b|billions?|thousands?|'000)"
-    pats = [r"(?:₹|rs\.?|inr|rupees|`|■)\s*(?:in\s+)?" + U,
+    U = r"(crores?|cr\b|lakhs?|lacs?|millions?|mn\b|billions?|thousands?|['‘’`]000)"
+    pats = [r"(?:₹|rs\.?|inr|rupees|`|■)\s*(?:/\s*)?(?:in\s+)?" + U,
             r"(?:amounts?|figures?)\s+(?:are\s+)?in\s+(?:\S{1,4}\s*)?" + U,
             r"\(\s*(?:\S{1,4}\s+)?in\s+" + U,
             r"\bin\s+(?:\S{1,4}\s+)?" + U + r"\b",
@@ -497,7 +539,12 @@ def parse_statement(pages_data, typ, fy_hint):
         unit = unit or detect_unit(top_text(pg, 0.4))
         body = [r for r in to_rows(pg) if 32 < r["y"] < pg["H"] - 40]
         title_re = TYPES[typ]["title"]
-        ttl = next((i for i, r in enumerate(body) if title_re.search(r["text"].lower())), -1)
+        # the title sits above the figures; a later sentence naming the statement ("The above Statement of Cash Flows
+        # has been prepared…") is a footnote, not a title
+        first_amt = next((i for i, r in enumerate(body)
+                          if sum(1 for w in r["words"] if re.search(r"\d[,.]\d", w["s"]) and is_num(w["s"])) >= 1
+                          and not MONTH_RE.search(r["text"])), len(body))
+        ttl = next((i for i, r in enumerate(body[:first_amt]) if title_re.search(r["text"].lower())), -1)
         hdr_end = -1
         for i in range(max(ttl, 0), min(len(body), 18)):
             amounts = sum(1 for w in body[i]["words"] if re.search(r"\d[,.]\d", w["s"]) and is_num(w["s"]))
@@ -505,7 +552,7 @@ def parse_statement(pages_data, typ, fy_hint):
                 break
             if is_header_row(body[i]["text"]):
                 hdr_end = i
-        title_idx = next((i for i, r in enumerate(body) if title_re.search(r["text"].lower()) or re.search(r"continued|contd", r["text"], re.I)), -1)
+        title_idx = next((i for i, r in enumerate(body[:first_amt]) if title_re.search(r["text"].lower()) or re.search(r"continued|contd", r["text"], re.I)), -1)
         start = max(hdr_end, title_idx) + 1
         end = len(body)
         for i in range(start, len(body)):
@@ -527,8 +574,11 @@ def parse_statement(pages_data, typ, fy_hint):
             if len(c["ws"]) < max(2, len(data_rows) * 0.08):
                 continue
             ws = c["ws"]
-            note = (sum(1 for w in ws if NOTE_RE.match(w["s"]) and "," not in w["s"]) / len(ws) >= 0.8
-                    and not any(re.search(r",\d{3}", w["s"]) or re.search(r"\.\d{2}$", w["s"]) for w in ws))
+            noteish = sum(1 for w in ws if NOTE_RE.match(w["s"]) and "," not in w["s"]) / len(ws) >= 0.8 and not any(re.search(r",\d{3}", w["s"]) for w in ws)
+            lo, hi = min(w["x0"] for w in ws) - 6, max(w["x1"] for w in ws) + 6
+            headed = any(re.fullmatch(r"notes?(\s*no\.?)?|no\.?|sch(edule)?\.?", w["s"].strip().lower()) and w["x1"] > lo and w["x0"] < hi
+                         for r in body[max(title_idx, 0):start] for w in r["words"])
+            note = noteish and (headed or not any(re.search(r"\.\d{2}$", w["s"]) for w in ws))
             cols.append({"right": median([w["x1"] for w in ws]), "left": min(w["x0"] for w in ws), "note": note})
         note_col = None
         first_val = next((i for i, c in enumerate(cols) if not c["note"]), -1)
@@ -607,6 +657,7 @@ def parse_statement(pages_data, typ, fy_hint):
                 tail = lab.pop()["s"]
                 note = f"{tail}, {note}" if note else tail
             label = re.sub(r"\s+", " ", " ".join(w["s"] for w in lab)).strip()
+            label = re.sub(r"\s+" + NAV + r"$", "", label, flags=re.I)        # section tab at the page edge, not part of the name
             m_note = re.search(r"\s+(\d{1,2}(?:\.\d{1,2})?\s?\([a-z]{1,3}\))$", label, re.I)
             if m_note:
                 label = label[:m_note.start()].strip()
@@ -617,15 +668,35 @@ def parse_statement(pages_data, typ, fy_hint):
         merged = []
         for i, L in enumerate(lines):
             prev = merged[-1] if merged else None
-            starts_lower = bool(re.match(r"^[a-z]", L["label"]) or re.match(r"^(and|or|of|in|to|from|on|for)\b", L["label"], re.I))
+            enumerated = bool(re.match(r"^\(?([ivx]{1,4}|[a-h])[).]\s", L["label"]))      # "iii. Trade payables", "(b) Provisions"
+            starts_lower = not enumerated and bool(re.match(r"^[a-z]", L["label"]) or re.match(r"^(and|or|of|in|to|from|on|for)\b", L["label"], re.I))
             if prev and not prev["hasVals"] and L["hasVals"] and (L["label"] == "" or starts_lower):
                 prev["label"] = (prev["label"] + " " + L["label"]).strip()
                 prev["vals"], prev["hasVals"], prev["note"] = L["vals"], True, prev["note"] or L["note"]
                 continue
-            if prev and prev["hasVals"] and not L["hasVals"] and starts_lower and L["label"]:
+            dangling = bool(prev and re.search(r"\b(from|of|and|in|to|on|for|the|before|after|with|by|towards|other than|continuing|discontinued)$", prev["label"], re.I))
+            if prev and prev["hasVals"] and not L["hasVals"] and (starts_lower or dangling) and L["label"]:
                 prev["label"] += " " + L["label"]
                 continue
             merged.append(dict(L))
+        # a block's subtotal printed with no name on the same line as the next block's heading
+        # ("Current Liabilities   19,764   24,881" right after the non-current items): split it into the subtotal and the heading
+        split = []
+        for k, r in enumerate(merged):
+            nxt = merged[k + 1] if k + 1 < len(merged) else None
+            prev_r = merged[k - 1] if k else None
+            if (r["hasVals"] and re.fullmatch(r"(non current|current) (assets|liabilities)", norm_label(r["label"]))
+                    and prev_r is not None and prev_r["hasVals"] and not is_total(prev_r["label"])
+                    and nxt is not None and (not nxt["hasVals"] or re.match(r"^\(?[a-h1-9][).]", nxt["label"]))):
+                split.append({"label": "", "note": None, "vals": r["vals"], "hasVals": True})
+                split.append({**r, "vals": [None] * len(r["vals"]), "hasVals": False})
+            else:
+                split.append(r)
+        merged = split
+        # leftovers that aren't lines: a unit caption ("₹ / Lakhs") or note numbers wrapped onto their own row ("& 4", "9 & 37")
+        merged = [r for r in merged if r["hasVals"] or not (re.fullmatch(r"\s*" + NAV + r"\s*", r["label"], re.I) or
+            re.fullmatch(r"[\s&,]*(\d{1,2}(\.\d{1,2})?\s*(\([a-z0-9]{1,3}\))?[\s,&]*)+", r["label"], re.I) or
+            re.fullmatch(r"(\s*(₹|`|rs\.?|inr|■)?\s*/?\s*(in\s+)?(lakhs?|lacs?|crores?|millions?|thousands?|billions?)\s*)+", r["label"], re.I))]
         for r in merged:
             r["kind"] = ("total" if is_total(r["label"]) else "item") if r["hasVals"] else "heading"
         out["rows"].extend(r for r in merged if r["label"] or r["hasVals"])
@@ -650,8 +721,47 @@ def parse_statement(pages_data, typ, fy_hint):
 # =====================================================================================
 #  5. Arithmetic ties
 # =====================================================================================
-def find_row(st, rx):
-    return next((r for r in st["rows"] if r["hasVals"] and re.search(rx, norm_label(r["label"]))), None)
+def find_row(st, rx, after=None):
+    """First line whose name matches, preferring lines with a figure in every year (a stray note or page number
+    read under a heading is not the real line)."""
+    rows = st["rows"]
+    start = rows.index(after) + 1 if after is not None and after in rows else 0
+    hits = [r for r in rows[start:] if r["hasVals"] and re.search(rx, norm_label(r["label"]))]
+    if not hits:
+        return None
+    filled = lambda r: sum(1 for c in r["vals"] if c)
+    most = max(filled(r) for r in hits)
+    return next(r for r in hits if filled(r) == most)
+
+
+def profit_tie(st, ti, te, tol):
+    """Total income − Total expenses lands on the first profit line after Total expenses. Lines printed between them
+    (share of associates, exceptional items, depreciation below an EBITDA line) are added or deducted as the report
+    shows; their sign is taken whichever way makes the arithmetic close, one line at a time."""
+    rows = st["rows"]
+    i = rows.index(te)
+    j = next((k for k in range(i + 1, len(rows)) if rows[k]["hasVals"] and re.match(r"^(profit|loss|earnings)", norm_label(rows[k]["label"]))
+              and not re.search(r"attributable|comprehensive", norm_label(rows[k]["label"]))), None)
+    if j is None:
+        return None
+    between = [r for r in rows[i + 1:j] if r["hasVals"]]
+    if len(between) > 4:
+        return None
+    pb = rows[j]
+
+    def fit(p):
+        if not ti["vals"][p] or not te["vals"][p] or not pb["vals"][p]:
+            return None
+        base = ti["vals"][p]["v"] - te["vals"][p]["v"]
+        target = pb["vals"][p]["v"]
+        xs = [r["vals"][p]["v"] if r["vals"][p] else 0.0 for r in between]
+        best = None
+        for mask in range(1 << len(xs)):
+            got = base + sum(x if mask >> b & 1 else -x for b, x in enumerate(xs))
+            if best is None or abs(got - target) < abs(best - target):
+                best = got
+        return best
+    return pb, fit
 
 
 def run_checks(st, typ):
@@ -685,11 +795,13 @@ def run_checks(st, typ):
         rev, oi, ti = find_row(st, r"^revenue from operations$"), find_row(st, r"^other income$"), find_row(st, r"^total (income|revenue)$")
         if rev and oi and ti:
             cmp("Revenue + Other income = Total income", lambda i: v(rev, i) + v(oi, i), lambda i: v(ti, i))
-        te, pb = find_row(st, r"^total expenses$"), find_row(st, r"^profit before (exceptional|tax|share)")
-        if ti and te and pb:
-            cmp("Total income − Total expenses = Profit before tax line", lambda i: v(ti, i) - v(te, i), lambda i: v(pb, i))
-        tots = [r for r in st["rows"] if r["hasVals"] and re.fullmatch(r"total", norm_label(r["label"]))]
+        te = find_row(st, r"^total (expenses|expenditure)$", after=ti)
+        tie = profit_tie(st, ti, te, tol) if ti and te else None
+        if tie:
+            pb, fit = tie
+            cmp("Total income − Total expenses = Profit before tax line", fit, lambda i: v(pb, i))
         np_ = find_row(st, r"^net profit")
+        tots = [r for r in st["rows"][:st["rows"].index(np_) if np_ else 0] if r["hasVals"] and re.fullmatch(r"total", norm_label(r["label"]))]
         if not ti and len(tots) == 2 and np_:
             cmp("Total income − Total expenditure = Net profit", lambda i: v(tots[0], i) - v(tots[1], i), lambda i: v(np_, i))
     if typ == "CF":
@@ -726,7 +838,8 @@ def verify(st, pages):
     first = pages[st["pages"][0] - 1] if st["pages"] and st["pages"][0] - 1 < len(pages) else None
     top = top_text(first) if first else ""
     own = TYPES[st["type"]]["title"].search(top)
-    others = [d["name"] for t, d in TYPES.items() if t != st["type"] and d["title"].search(top)]
+    head = heading_text(first) if first else ""
+    others = [d["name"] for t, d in TYPES.items() if t != st["type"] and d["title"].search(head)]
     if not first:
         detail = "page missing"
     elif not own:
@@ -781,7 +894,31 @@ def verify(st, pages):
 # =====================================================================================
 #  7. Pipeline
 # =====================================================================================
+OPENING = {"BS": re.compile(r"non[- ]?current\s+assets|\bassets\b|capital\s+and\s+liabilities"),
+           "PL": re.compile(r"revenue\s+from\s+operations|interest\s+earned|total\s+income|\bincome\b"),
+           "CF": re.compile(r"operating\s+activities")}
+
+
+def first_page(pages, typ, n):
+    """The page found may be the second page of a statement that runs over two; step back to where it starts."""
+    for _ in range(2):
+        cur = pages[n - 1] if n >= 1 else None
+        contd = cur is not None and re.search(r"\(?\b(contd|continued)\b", heading_text(cur))
+        if n <= 1 or (OPENING[typ].search(cur["text"].lower()) and not contd):
+            break
+        prev = pages[n - 2]
+        head = heading_text(prev)
+        if (TYPES[typ]["title"].search(head[:160]) and OPENING[typ].search(prev["text"].lower())
+                and not re.search(r"notes?\s+(to|forming)", head[:160])):
+            n -= 1
+        else:
+            break
+    return n
+
+
 def build_statement(pages, typ, basis, page_nums, fy_hint):
+    if len(page_nums) == 1:
+        page_nums = [first_page(pages, typ, page_nums[0])]
     use = [pages[n - 1] for n in page_nums if 0 < n <= len(pages)]
     st = parse_statement(use, typ, fy_hint)
     if len(page_nums) == 1:
@@ -794,7 +931,8 @@ def build_statement(pages, typ, basis, page_nums, fy_hint):
             nx = pages[n]
             top = top_text(nx)
             other = any(t != typ and d["title"].search(top) for t, d in TYPES.items())
-            if EXCLUDE_TOP.search(top) or other:
+            own = TYPES[typ]["title"].search(top) and not re.search(r"notes?\s+(to|forming)", top)
+            if (EXCLUDE_TOP.search(top) and not own) or other:
                 break
             if sum(1 for w in nx["words"] if is_num(w["s"]) and re.search(r"\d,\d|\d\.\d", w["s"])) < 6:
                 break
@@ -936,7 +1074,7 @@ def merge_years(items, out_unit):
         scale = max(scale, factor * 10 ** (2 - st["decimals"]))
     rounding = 0.011 * scale
 
-    rows, idx, by_label = [], {}, {}
+    rows, idx, by_label, by_canon = [], {}, {}, {}
     for x in views:
         last_pos = -1
         for r in x["v"]["rows"]:
@@ -947,6 +1085,10 @@ def merge_years(items, out_unit):
             if m is None:  # same line under a slightly different heading or name in another year
                 cands = [c for c in by_label.get(nl, []) if x["file"] not in c["files"] and c["kind"] == r["kind"]
                          and c.get("major", "") == r.get("major", "")]
+                if not cands and r["kind"] != "heading":   # same meaning in other words ("Deferred tax" / "Deferred tax expense")
+                    cw = canon_words(r["label"])
+                    cands = [c for c in by_canon.get(cw, []) if x["file"] not in c["files"] and c["kind"] != "heading"
+                             and c.get("major", "") == r.get("major", "")] if cw else []
                 if cands:
                     after = [c for c in cands if rows.index(c) > last_pos]
                     m = (after or cands)[0]
@@ -956,6 +1098,8 @@ def merge_years(items, out_unit):
                 rows.insert(last_pos + 1, m)
                 idx[r["key"]] = m
                 by_label.setdefault(nl, []).append(m)
+                if r["kind"] != "heading":
+                    by_canon.setdefault(canon_words(r["label"]), []).append(m)
             m["files"].add(x["file"])
             m["aliases"].add(nl)
             last_pos = rows.index(m)
@@ -972,11 +1116,12 @@ def merge_years(items, out_unit):
     i = 0
     while i < len(rows):
         a = rows[i]
-        for j in range(i + 1, min(i + 4, len(rows))):
+        for j in near_rows(rows, i):
             b = rows[j]
             same_name = norm_label(b["label"]) == norm_label(a["label"])
-            if b["kind"] == a["kind"] and ((same_name and not (set(a["vals"]) & set(b["vals"]))) or
-                                          (split_pair(a, b) and (name_similarity(a["label"], b["label"]) >= 0.6 or not a["label"].strip() or not b["label"].strip()))):
+            if (b["kind"] == "heading") == (a["kind"] == "heading") and (
+                    (same_name and b["kind"] == a["kind"] and not (set(a["vals"]) & set(b["vals"]))) or
+                    (split_pair(a, b) and (same_line(a["label"], b["label"]) or not a["label"].strip() or not b["label"].strip()))):
                 rank = lambda row: min((order[f] for f in row["files"]), default=99)   # 0 = latest report
                 if b["label"].strip() and (not a["label"].strip() or rank(b) < rank(a)):
                     a["label"] = b["label"]
@@ -1028,6 +1173,18 @@ def report_differences(m):
     return out
 
 
+def near_rows(rows, i, reach=6):
+    """Rows after row i that a renamed copy of it could sit at: the next few lines, not past a total that closes the block."""
+    out = []
+    for j in range(i + 1, len(rows)):
+        if len(out) >= reach:
+            break
+        out.append(j)
+        if rows[j]["kind"] == "total" and rows[i]["kind"] != "total":
+            break
+    return out
+
+
 def split_pair(a, b):
     """Two rows that are one line printed under two names: no single report contains both, they agree on every year
     they share, and the shared figures aren't all zero."""
@@ -1039,6 +1196,95 @@ def split_pair(a, b):
     if any(abs(a["vals"][k]["v"] - b["vals"][k]["v"]) > 0.011 for k in shared):
         return False
     return any(abs(a["vals"][k]["v"]) > 1e-9 for k in shared)
+
+
+# -------------------------------------------------------------------------------------
+#  Finance vocabulary: names that mean the same line, whichever way a report words it.
+#  Built from Schedule III (Division I → Division II / Ind AS renamings) and the wording
+#  used across large Indian annual reports. Each entry: pattern → the word(s) it reads as.
+# -------------------------------------------------------------------------------------
+SYNONYMS = [
+    # Schedule III renamings (old Indian GAAP → Ind AS)
+    (r"\blong term\b", "non current"), (r"\bshort term\b", "current"),
+    (r"\bfixed assets?\b", "property plant and equipment"), (r"\btangible assets?\b", "property plant and equipment"),
+    (r"\bsundry debtors\b", "trade receivables"), (r"\bdebtors\b", "trade receivables"),
+    (r"\bsundry creditors\b", "trade payables"), (r"\bcreditors\b", "trade payables"),
+    (r"\breserves? (and|&) surplus\b", "other equity"), (r"\bshare capital\b", "equity share capital"),
+    (r"\bequity equity\b", "equity"), (r"\bminority interests?\b", "non controlling interests"),
+    (r"\bstock in trade\b", "traded goods"), (r"\bstores (and|&) spares\b", "stores spares"),
+    # same thing, different word
+    (r"\bexpenditure\b", "expense"), (r"\bexpenses\b", "expense"), (r"\bcosts?\b", "cost"),
+    (r"\bamortization\b", "amortisation"), (r"\bimpairment losses?\b", "impairment"),
+    (r"\bwritten off\b", "write off"), (r"\bwrite offs?\b", "write off"),
+    (r"\bjoint ventures?\b", "joint venture"), (r"\bassociate companies\b", "associates"),
+    (r"\bdividends? (paid|distributed)\b", "dividend paid"), (r"\bpayment of dividends?\b", "dividend paid"),
+    (r"\bincome tax(es)? paid\b", "tax paid"), (r"\btaxes paid\b", "tax paid"), (r"\bdirect taxes\b", "tax"),
+    (r"\bcash generated from operations\b", "cash from operations"),
+    (r"\bfinance charges?\b", "finance cost"), (r"\binterest expense\b", "finance cost"),
+    (r"\bprincipal (portion |element )?(of )?lease (liabilities|payments?)\b", "lease liabilities"),
+    (r"\b(re)?payments? of lease liabilities\b", "lease liabilities paid"),
+    (r"\bbank balances? other than\b", "other bank balances"),
+    (r"\b(from|of) continuing operations?\b", ""),
+    (r"\b(deferred |current )?tax (on |relating to |in respect of )?exceptional( items?)?\b", "tax exceptional item"),
+    (r"\bexceptional( items?)?\b", "exceptional item"),
+    # prefixes and qualifiers that don't change the line
+    (r"^(less|add|add less|less add)\b", ""), (r"\bprevious year\b.*$", ""), (r"\b(gross|net) of\b.*$", ""),
+    (r"\b(refer|see) note\b.*$", ""), (r"\bmentioned above\b|\babove\b|\bthereon\b", ""),
+]
+_SYN = [(re.compile(p), r) for p, r in SYNONYMS]
+STOP = {"of", "in", "on", "for", "from", "to", "and", "by", "the", "a", "an", "at", "with", "than", "its", "as", "or", "into"}
+WEAK = {"net", "gain", "loss", "profit", "share", "total", "value"}   # don't decide a match on their own
+DIRECTION = {"proceed", "repayment", "receipt", "payment", "paid", "received", "increase", "decrease",
+             "inflow", "outflow", "generated", "used", "credit", "charge"}
+QUALIFIERS = {"non", "current", "other", "deferred", "gross", "accumulated", "secured", "unsecured", "foreign", "domestic",
+              "capital", "revenue", "equity", "preference", "financial", "operating", "investing", "financing", "subsidiary",
+              "associate", "joint", "parent", "owner", "controlling", "earlier", "previous", "exceptional", "tax", "dividend",
+              "provision", "reserve", "depreciation", "allowance", "discontinued", "minority", "lease", "deposit"}
+
+
+def _stem(w):
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    return w
+
+
+def canon_words(label: str) -> frozenset:
+    """A line name reduced to the words that carry its meaning."""
+    s = label.lower()
+    for rx, canon in _ALT_RX:
+        s = rx.sub(canon, s)
+    s = re.sub(r"\([^()]{0,60}\)|\[[^\[\]]{0,60}\]", " ", s)       # comments in brackets: "(Previous year …)", "(net)", "[A+B]"
+    s = re.sub(r"\s[-–—]\s.*$", "", s) if re.search(r"\s[-–—]\s", s) and len(s) > 40 else s
+    s = norm_label(s)
+    for rx, canon in _SYN:
+        s = rx.sub(canon, s)
+    words = [_stem(w) for w in s.split() if w not in STOP and not w.isdigit()]
+    if "tax" in words and "deferred" in words:                         # deferred tax expense / charge / credit
+        words = [w for w in words if w not in ("expense", "charge", "credit")]
+    return frozenset(words)
+
+
+def same_line(x: str, y: str) -> bool:
+    """Do two names mean the same line? Same meaning words, ignoring direction words (proceeds/repayment,
+    increase/decrease, profit/loss) that reports flip between years; or one name is the other plus detail."""
+    a, b = canon_words(x), canon_words(y)
+    if not a or not b:
+        return not a and not b
+    if a == b:
+        return True
+    da, db = a & DIRECTION, b & DIRECTION
+    both_ways = lambda t: bool(re.search(r"\bnet\b|/", t.lower()))   # "Proceeds/(repayment) … (net)" covers both directions
+    if da and db and da.isdisjoint(db) and not (both_ways(x) or both_ways(y)):
+        return False                                                     # "Proceeds from borrowings" is not "Repayment of borrowings"
+    ca, cb = a - DIRECTION - WEAK, b - DIRECTION - WEAK
+    if ca and ca == cb:
+        return True
+    small, big = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
+    if len(small) >= 2 and small < big and not ((big - small) & QUALIFIERS):   # "Exceptional items" / "… - gain on sale of shares"
+        return True
+    return len(ca & cb) / max(1, len(ca | cb)) >= 0.75
 
 
 def name_similarity(x, y):
@@ -1085,10 +1331,13 @@ def integrity(m, typ):
             said = [v for alias in (r.get("aliases") or {norm_label(r["label"])}) for v in src.get((alias, p["key"]), [])]
             if not said or not any(abs(v - c["v"]) < 0.011 for v in said):
                 issues.append(f"{p['label']} figure for \"{r['label']}\" ({c['v']:g}) doesn't match that line in {c['file']}")
-    body = [r for r in m["rows"] if r["kind"] != "heading"]
-    for i, a in enumerate(body):
-        for b in body[i + 1:i + 4]:
-            if split_pair(a, b):
+    rows = m["rows"]
+    for i, a in enumerate(rows):
+        if a["kind"] == "heading":
+            continue
+        for j in near_rows(rows, i):
+            b = rows[j]
+            if b["kind"] != "heading" and split_pair(a, b) and same_line(a["label"], b["label"]):
                 issues.append(f"\"{a['label']}\" and \"{b['label']}\" look like one line split in two (same figure for the year they share)")
     rx, name = KEY_LINES[typ]
     key_rows = [r for r in m["rows"] if r["kind"] != "heading" and re.search(rx, norm_label(r["label"]))]
