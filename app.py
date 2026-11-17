@@ -36,7 +36,7 @@ TYPES = {
            "body": re.compile(r"operating\s+activities|investing\s+activities|financing\s+activities")},
 }
 EXCLUDE_TOP = re.compile(r"notes?\s+(to|forming)|accounting\s+polic|independent\s+auditor|auditor'?s'?\s+report|annexure|board'?s'?\s+report|"
-                         r"directors'?\s+report|management\s+discussion|ten[- ]year|financial\s+highlights|key\s+ratios|statement\s+of\s+changes\s+in\s+equity")
+                         r"directors'?\s+report|management\s+discussion|ten[- ]year|financial\s+highlights|key\s+ratios|track\s+record|financial\s+summary|at\s+a\s+glance|five[- ]year|decade|statement\s+of\s+changes\s+in\s+equity")
 END_MARK = re.compile(r"accompanying\s+notes|as\s+per\s+our\s+report|for\s+and\s+on\s+behalf|notes\s+referred\s+to\s+above|see\s+accompanying|"
                       r"summary\s+of\s+(significant|material)\s+accounting|in\s+terms\s+of\s+our\s+report|the\s+notes\s+are\s+an\s+integral|"
                       r"forms?\s+an?\s+integral\s+part|schedules\s+referred\s+to", re.I)
@@ -874,8 +874,13 @@ def verify(st, pages):
 
     keys = [p["key"] for p in st["periods"]]
     dated = bool(st["periods"]) and all(p["date"] for p in st["periods"]) and len(set(keys)) == len(keys)
-    res.append({"name": "Year columns identified", "ok": dated,
-                "detail": ", ".join(p["label"] + (" (from title)" if p.get("inferred") else "") for p in st["periods"]) if dated else "could not tell which year each column is"})
+    fy = st.get("fyHint")
+    latest = max((p["date"]["y"] for p in st["periods"] if p["date"]), default=0)
+    in_year = not (dated and fy) or (fy - 1 <= latest <= fy and len(st["periods"]) <= 4)   # a 12-year track record is not this year's statement
+    res.append({"name": "Year columns identified", "ok": dated and in_year,
+                "detail": (", ".join(p["label"] + (" (from title)" if p.get("inferred") else "") for p in st["periods"])
+                           + ("" if in_year else f", which are not this report's years ({fy - 1}-{fy}); likely a multi-year summary")) if dated
+                else "could not tell which year each column is"})
 
     hard = [c for c in st["checks"] if c["hard"]]
     bad = [c for c in hard if not c["ok"]]
@@ -940,7 +945,7 @@ def build_statement(pages, typ, basis, page_nums, fy_hint):
             use.append(nx)
         if len(use) > 1:
             st = parse_statement(use, typ, fy_hint)
-    st.update(type=typ, basis=basis, name=TYPES[typ]["name"], pages=[p["n"] for p in use],
+    st.update(type=typ, basis=basis, name=TYPES[typ]["name"], fyHint=fy_hint, pages=[p["n"] for p in use],
               pdfPages=list(dict.fromkeys(p["pdfPage"] for p in use)), where=", ".join(page_name(p) for p in use))
     st["checks"] = run_checks(st, typ)  # ties are checked on the full statement as printed
     if typ == "PL":
@@ -1065,6 +1070,12 @@ def merge_years(items, out_unit):
                 seen.add(k)
                 periods.append({**p, "key": k, "header": "" if p.get("inferred") else p.get("header", "")})
     periods.sort(key=date_key)  # oldest on the left, latest on the right
+    # A year's column is taken whole from the latest report that covers it. Mixing lines from two reports in one column
+    # breaks its totals whenever the newer report regrouped or restated something.
+    owner = {}
+    for x in views:
+        for k in x["keys"]:
+            owner.setdefault(k, x["file"])
 
     # printed reports round each line; the allowed rounding gap grows when figures are converted to a larger number
     scale = 1.0
@@ -1084,17 +1095,17 @@ def merge_years(items, out_unit):
                 m = None
             if m is None:  # same line under a slightly different heading or name in another year
                 cands = [c for c in by_label.get(nl, []) if x["file"] not in c["files"] and c["kind"] == r["kind"]
-                         and c.get("major", "") == r.get("major", "")]
+                         and sec_key(c.get("major", "")) == sec_key(r.get("major", ""))]
                 if not cands and r["kind"] != "heading":   # same meaning in other words ("Deferred tax" / "Deferred tax expense")
                     cw = canon_words(r["label"])
                     cands = [c for c in by_canon.get(cw, []) if x["file"] not in c["files"] and c["kind"] != "heading"
-                             and c.get("major", "") == r.get("major", "")] if cw else []
+                             and sum_line(c["label"]) == sum_line(r["label"]) and sec_key(c.get("major", "")) == sec_key(r.get("major", ""))] if cw else []
                 if cands:
                     after = [c for c in cands if rows.index(c) > last_pos]
                     m = (after or cands)[0]
             if m is None:
                 m = {"label": r["label"], "note": r["note"], "kind": r["kind"], "key": r["key"], "noConvert": r["noConvert"],
-                     "major": r.get("major", ""), "vals": {}, "restated": {}, "files": set(), "aliases": set()}
+                     "major": r.get("major", ""), "vals": {}, "restated": {}, "dropped": {}, "files": set(), "aliases": set()}
                 rows.insert(last_pos + 1, m)
                 idx[r["key"]] = m
                 by_label.setdefault(nl, []).append(m)
@@ -1106,33 +1117,41 @@ def merge_years(items, out_unit):
             for c, k in zip(r["vals"], x["keys"]):
                 if not c:
                     continue
-                if k not in m["vals"]:
-                    m["vals"][k] = {"v": c["v"], "file": x["file"]}          # reports are read latest first, so this is the latest figure
-                elif abs(m["vals"][k]["v"] - c["v"]) > rounding and k not in m["restated"]:
-                    m["restated"][k] = {"v": c["v"], "file": x["file"]}      # what an older report printed for the same year
+                if owner[k] == x["file"]:
+                    m["vals"].setdefault(k, {"v": c["v"], "file": x["file"]})
+                else:                                                        # an older report's figure for a year a newer one covers
+                    m["dropped"].setdefault(k, {"v": c["v"], "file": x["file"]})
 
     # the same line split across two rows (one per set of years) is joined into one, worded as in the latest report
     order = {x["file"]: n for n, x in enumerate(views)}
     i = 0
     while i < len(rows):
         a = rows[i]
-        for j in near_rows(rows, i):
+        near = set(near_rows(rows, i))
+        for j in range(i + 1, len(rows)):
             b = rows[j]
             same_name = norm_label(b["label"]) == norm_label(a["label"])
             if (b["kind"] == "heading") == (a["kind"] == "heading") and (
-                    (same_name and b["kind"] == a["kind"] and not (set(a["vals"]) & set(b["vals"]))) or
-                    (split_pair(a, b) and (same_line(a["label"], b["label"]) or not a["label"].strip() or not b["label"].strip()))):
+                    (j in near and same_name and b["kind"] == a["kind"] and not (set(a["vals"]) & set(b["vals"]))) or
+                    (sec_key(a.get("major", "")) == sec_key(b.get("major", "")) and same_line_split(a, b)) or
+                    (j in near and split_pair(a, b) and (not a["label"].strip() or not b["label"].strip()))):
                 rank = lambda row: min((order[f] for f in row["files"]), default=99)   # 0 = latest report
                 if b["label"].strip() and (not a["label"].strip() or rank(b) < rank(a)):
                     a["label"] = b["label"]
                 for k, v in b["vals"].items():
                     a["vals"].setdefault(k, v)
-                a["restated"].update(b["restated"]); a["files"] |= b["files"]
+                for k, v in b["dropped"].items():
+                    a["dropped"].setdefault(k, v)
+                a["files"] |= b["files"]
                 a["aliases"] |= b["aliases"]
                 del rows[j]
                 break
         else:
             i += 1
+    for row in rows:    # an older report printed a different figure for a year the latest report covers: keep it as a note
+        for k, d in row["dropped"].items():
+            if k in row["vals"] and abs(row["vals"][k]["v"] - d["v"]) > rounding and k not in row["restated"]:
+                row["restated"][k] = d
     units = list(dict.fromkeys(x["v"]["unit"] for x in views))
     # what each report says, line by line, for the final trace check
     sources = {}
@@ -1173,6 +1192,18 @@ def report_differences(m):
     return out
 
 
+def sec_key(major: str) -> str:
+    """The section a line sits in, worded the same whichever way a report titles it:
+    "Operating activities" = "A. Cash flows from operating activities" = "Cash flow from operating activities"."""
+    m = (major or "").lower()
+    for k in ("operating", "investing", "financing"):
+        if f"{k} activities" in m:
+            return k
+    if m in ("expenditure", "expenses", "tax expense", "tax expenses"):     # one report nests the tax lines under "Expenses", another doesn't
+        return "expenses"
+    return "equity and liabilities" if m == "capital and liabilities" else m
+
+
 def near_rows(rows, i, reach=6):
     """Rows after row i that a renamed copy of it could sit at: the next few lines, not past a total that closes the block."""
     out = []
@@ -1183,6 +1214,23 @@ def near_rows(rows, i, reach=6):
         if rows[j]["kind"] == "total" and rows[i]["kind"] != "total":
             break
     return out
+
+
+def sum_line(label: str) -> bool:
+    """A subtotal or total ("Total assets", "Net cash from operating activities"), as opposed to a line that merely starts
+    with "Net…" or "Profit…". A subtotal is never the same line as an ordinary one."""
+    return bool(re.match(r"^(total|grand total|sub total|subtotal|net cash|net increase|net decrease|cash and cash equivalents at the end)",
+                         norm_label(label)))
+
+
+def same_line_split(a, b):
+    """The same line printed under two names in different reports. No report contains both rows, and the names mean
+    the same thing (see same_line). Years need not overlap: a report in between may be missing."""
+    if a["kind"] == "heading" or b["kind"] == "heading":
+        return False
+    if a.get("files") and b.get("files") and (a["files"] & b["files"]):
+        return False
+    return sum_line(a["label"]) == sum_line(b["label"]) and same_line(a["label"], b["label"])
 
 
 def split_pair(a, b):
@@ -1220,7 +1268,7 @@ SYNONYMS = [
     (r"\bdividends? (paid|distributed)\b", "dividend paid"), (r"\bpayment of dividends?\b", "dividend paid"),
     (r"\bincome tax(es)? paid\b", "tax paid"), (r"\btaxes paid\b", "tax paid"), (r"\bdirect taxes\b", "tax"),
     (r"\bcash generated from operations\b", "cash from operations"),
-    (r"\bfinance charges?\b", "finance cost"), (r"\binterest expense\b", "finance cost"),
+    (r"\bacquisitions?\b", "purchase"), (r"\bfinance charges?\b", "finance cost"), (r"\binterest expense\b", "finance cost"),
     (r"\bprincipal (portion |element )?(of )?lease (liabilities|payments?)\b", "lease liabilities"),
     (r"\b(re)?payments? of lease liabilities\b", "lease liabilities paid"),
     (r"\bbank balances? other than\b", "other bank balances"),
@@ -1239,7 +1287,8 @@ DIRECTION = {"proceed", "repayment", "receipt", "payment", "paid", "received", "
 QUALIFIERS = {"non", "current", "other", "deferred", "gross", "accumulated", "secured", "unsecured", "foreign", "domestic",
               "capital", "revenue", "equity", "preference", "financial", "operating", "investing", "financing", "subsidiary",
               "associate", "joint", "parent", "owner", "controlling", "earlier", "previous", "exceptional", "tax", "dividend",
-              "provision", "reserve", "depreciation", "allowance", "discontinued", "minority", "lease", "deposit"}
+              "provision", "reserve", "depreciation", "allowance", "discontinued", "minority", "lease", "deposit",
+              "sale", "disposal", "redemption", "maturity", "buyback", "interest", "borrowing", "dividend"}
 
 
 def _stem(w):
@@ -1335,10 +1384,10 @@ def integrity(m, typ):
     for i, a in enumerate(rows):
         if a["kind"] == "heading":
             continue
-        for j in near_rows(rows, i):
+        for j in range(i + 1, len(rows)):
             b = rows[j]
-            if b["kind"] != "heading" and split_pair(a, b) and same_line(a["label"], b["label"]):
-                issues.append(f"\"{a['label']}\" and \"{b['label']}\" look like one line split in two (same figure for the year they share)")
+            if sec_key(a.get("major", "")) == sec_key(b.get("major", "")) and same_line_split(a, b):
+                issues.append(f"\"{a['label']}\" and \"{b['label']}\" look like one line split in two (same line, worded differently in different reports)")
     rx, name = KEY_LINES[typ]
     key_rows = [r for r in m["rows"] if r["kind"] != "heading" and re.search(rx, norm_label(r["label"]))]
     for p in m["periods"]:
